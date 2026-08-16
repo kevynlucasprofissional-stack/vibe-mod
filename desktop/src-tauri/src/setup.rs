@@ -17,6 +17,10 @@ pub static STATIC_APP: Lazy<std::sync::Mutex<Option<tauri::AppHandle>>> = Lazy::
 
 pub struct SonaState {
     pub process: Option<SonaProcess>,
+    /// Engine reported by Sona metadata for the model currently loaded through
+    /// the desktop GUI. `None` is kept for unknown/custom models and is treated
+    /// conservatively as Whisper-compatible by the chunk-protection layer.
+    pub model_engine: Option<String>,
 }
 
 pub fn setup(app: &App) -> Result<(), Box<dyn std::error::Error>> {
@@ -29,7 +33,10 @@ pub fn setup(app: &App) -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|_| panic!("cant create app config directory at {}", app_config_dir.display()));
 
     // Manage sona state
-    app.manage(Mutex::new(SonaState { process: None }));
+    app.manage(Mutex::new(SonaState {
+        process: None,
+        model_engine: None,
+    }));
     app.manage(crate::dictation_indicator::DictationIndicatorRuntime::default());
 
     let store = app.store(STORE_FILENAME)?;
