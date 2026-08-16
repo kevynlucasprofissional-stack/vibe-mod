@@ -1,8 +1,10 @@
+use crate::diagnostics::DiagnosticsState;
 use crate::error::LogError;
 use eyre::{bail, Context, Result};
 use futures::future::{AbortHandle, Abortable};
 use futures_util::StreamExt;
 use serde::Serialize;
+use serde_json::json;
 use std::{
     io::Write,
     path::{Path, PathBuf},
@@ -147,26 +149,149 @@ async fn download_to_partial(
 #[tauri::command]
 pub async fn download_model(app_handle: tauri::AppHandle, url: String, path: String) -> Result<DownloadModelResult> {
     tracing::debug!("Download model invoked! with path {}", path);
+    let diagnostics = app_handle.state::<DiagnosticsState>();
+    let run_id = diagnostics
+        .start_run(
+            "model_download",
+            json!({
+                "url": safe_url_summary(&url),
+                "destination": path.clone(),
+                "kind": "model",
+            }),
+        )
+        .ok();
 
-    match download_to_partial(&app_handle, &url, Path::new(&path), true).await? {
-        DownloadOutcome::Completed => Ok(DownloadModelResult::Completed { path }),
-        DownloadOutcome::Cancelled => Ok(DownloadModelResult::Cancelled),
+    if let Some(id) = run_id.as_deref() {
+        diagnostics
+            .record_event(id, "info", "download", "download.started", "Model download started", json!({}))
+            .log_error();
+    }
+
+    let result = download_to_partial(&app_handle, &url, Path::new(&path), true).await;
+    match result {
+        Ok(DownloadOutcome::Completed) => {
+            if let Some(id) = run_id.as_deref() {
+                diagnostics
+                    .finish_run(
+                        id,
+                        "succeeded",
+                        json!({
+                            "outcome": "completed",
+                            "destination": path.clone(),
+                            "size_bytes": std::fs::metadata(&path).ok().map(|metadata| metadata.len()),
+                        }),
+                    )
+                    .log_error();
+            }
+            Ok(DownloadModelResult::Completed { path })
+        }
+        Ok(DownloadOutcome::Cancelled) => {
+            if let Some(id) = run_id.as_deref() {
+                diagnostics
+                    .finish_run(id, "aborted", json!({ "outcome": "cancelled" }))
+                    .log_error();
+            }
+            Ok(DownloadModelResult::Cancelled)
+        }
+        Err(error) => {
+            if let Some(id) = run_id.as_deref() {
+                diagnostics
+                    .record_event(
+                        id,
+                        "error",
+                        "download",
+                        "download.failed",
+                        "Model download failed",
+                        json!({ "error": format!("{error:#}") }),
+                    )
+                    .log_error();
+                diagnostics
+                    .finish_run(id, "failed", json!({ "error": format!("{error:#}") }))
+                    .log_error();
+            }
+            Err(error)
+        }
     }
 }
 
 #[tauri::command]
 pub async fn download_file(app_handle: tauri::AppHandle, url: String, path: String) -> Result<()> {
     tracing::debug!("Download file invoked! with path {}", path);
+    let diagnostics = app_handle.state::<DiagnosticsState>();
+    let run_id = diagnostics
+        .start_run(
+            "file_download",
+            json!({
+                "url": safe_url_summary(&url),
+                "destination": path.clone(),
+                "kind": "file",
+            }),
+        )
+        .ok();
 
-    match download_to_partial(&app_handle, &url, Path::new(&path), false).await? {
-        DownloadOutcome::Completed => Ok(()),
-        DownloadOutcome::Cancelled => bail!("Download cancelled"),
+    let result = download_to_partial(&app_handle, &url, Path::new(&path), false).await;
+    match result {
+        Ok(DownloadOutcome::Completed) => {
+            if let Some(id) = run_id.as_deref() {
+                diagnostics
+                    .finish_run(
+                        id,
+                        "succeeded",
+                        json!({
+                            "outcome": "completed",
+                            "destination": path.clone(),
+                            "size_bytes": std::fs::metadata(&path).ok().map(|metadata| metadata.len()),
+                        }),
+                    )
+                    .log_error();
+            }
+            Ok(())
+        }
+        Ok(DownloadOutcome::Cancelled) => {
+            if let Some(id) = run_id.as_deref() {
+                diagnostics
+                    .finish_run(id, "aborted", json!({ "outcome": "cancelled" }))
+                    .log_error();
+            }
+            bail!("Download cancelled")
+        }
+        Err(error) => {
+            if let Some(id) = run_id.as_deref() {
+                diagnostics
+                    .record_event(
+                        id,
+                        "error",
+                        "download",
+                        "download.failed",
+                        "File download failed",
+                        json!({ "error": format!("{error:#}") }),
+                    )
+                    .log_error();
+                diagnostics
+                    .finish_run(id, "failed", json!({ "error": format!("{error:#}") }))
+                    .log_error();
+            }
+            Err(error)
+        }
+    }
+}
+
+fn safe_url_summary(value: &str) -> String {
+    match url::Url::parse(value) {
+        Ok(mut parsed) => {
+            parsed.set_query(None);
+            parsed.set_fragment(None);
+            let _ = parsed.set_username("");
+            let _ = parsed.set_password(None);
+            parsed.to_string()
+        }
+        Err(_) => "<invalid-or-non-url>".to_string(),
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{partial_path, publish_download, remove_if_exists};
+    use super::{partial_path, publish_download, remove_if_exists, safe_url_summary};
     use std::{fs, path::PathBuf, time::SystemTime};
 
     fn test_dir(name: &str) -> PathBuf {
@@ -176,10 +301,7 @@ mod tests {
 
     #[test]
     fn partial_path_keeps_the_model_extension_out_of_the_final_suffix() {
-        assert_eq!(
-            partial_path(PathBuf::from("model.bin").as_path()),
-            PathBuf::from("model.bin.part")
-        );
+        assert_eq!(partial_path(PathBuf::from("model.bin").as_path()), PathBuf::from("model.bin.part"));
     }
 
     #[test]
@@ -189,9 +311,7 @@ mod tests {
         let destination = dir.join("model.bin");
         let partial = partial_path(&destination);
         fs::write(&partial, b"complete model").unwrap();
-
         publish_download(&partial, &destination).unwrap();
-
         assert_eq!(fs::read(&destination).unwrap(), b"complete model");
         assert!(!partial.exists());
         fs::remove_dir_all(dir).unwrap();
@@ -206,13 +326,21 @@ mod tests {
         let backup = dir.join("yt-dlp.backup");
         fs::write(&destination, b"old binary").unwrap();
         fs::write(&partial, b"new binary").unwrap();
-
         publish_download(&partial, &destination).unwrap();
-
         assert_eq!(fs::read(&destination).unwrap(), b"new binary");
         assert!(!partial.exists());
         assert!(!backup.exists());
         remove_if_exists(&destination).unwrap();
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn diagnostic_url_summary_removes_credentials_query_and_fragment() {
+        let value = safe_url_summary("https://user:pass@example.com/model.bin?token=secret#fragment");
+        assert!(!value.contains("secret"));
+        assert!(!value.contains("pass"));
+        assert!(!value.contains("token"));
+        assert!(!value.contains("fragment"));
+        assert!(value.contains("example.com/model.bin"));
     }
 }
