@@ -3,6 +3,8 @@ import { invoke } from '@tauri-apps/api/core'
 import { ls } from './fs'
 import * as os from '@tauri-apps/plugin-os'
 
+const ISSUE_DIAGNOSTIC_MAX_CHARS = 16000
+
 export async function getPrettyVersion() {
 	const appVersion = await app.getVersion()
 	const appName = await app.getName()
@@ -49,13 +51,11 @@ export async function collectLogs() {
 		let info = await getAppInfo()
 		const diagnostic = await invoke<string | null>('get_latest_diagnostic_report_content')
 		if (diagnostic) {
-			info += `\n\n<details>\n<summary>latest structured diagnostic report</summary>\n\n\`\`\`json\n${diagnostic}\n\`\`\`\n</details>\n`
+			const excerpt = compactDiagnosticForIssue(diagnostic)
+			info += `\n\n<details>\n<summary>latest structured diagnostic report (excerpt)</summary>\n\n\`\`\`json\n${excerpt}\n\`\`\`\n\nFull report: use Settings > Advanced > Copy latest diagnostic / Show latest diagnostic and attach the JSON file when needed.\n</details>\n`
 			return info
 		}
 
-		// Compatibility fallback for installations that have not generated a
-		// structured report yet. Include warnings as well as errors and keep more
-		// context than the old ten-error-line collector.
 		const logs = await invoke<string>('get_logs')
 		const relevantLogs = logs
 			.split('\n')
@@ -71,4 +71,11 @@ export async function collectLogs() {
 		console.error(error)
 		return `Couldn't collect diagnostic information: ${error}`
 	}
+}
+
+function compactDiagnosticForIssue(diagnostic: string) {
+	if (diagnostic.length <= ISSUE_DIAGNOSTIC_MAX_CHARS) return diagnostic
+	const headChars = 11000
+	const tailChars = ISSUE_DIAGNOSTIC_MAX_CHARS - headChars
+	return `${diagnostic.slice(0, headChars)}\n\n... <diagnostic truncated for issue URL; attach full JSON> ...\n\n${diagnostic.slice(-tailChars)}`
 }
