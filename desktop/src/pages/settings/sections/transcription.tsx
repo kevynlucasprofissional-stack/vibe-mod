@@ -6,10 +6,36 @@ import { Switch } from '~/components/ui/switch'
 import { SectionCard, type SettingsViewModel } from './shared'
 
 export function TranscriptionSection({ vm }: { vm: SettingsViewModel }) {
+	const isPortuguese = vm.preference.displayLanguage === 'pt-BR'
+	const chunkingEnabled = vm.preference.modelOptions.chunking_enabled !== false
+	const setChunkingEnabled = (checked: boolean) => {
+		vm.preference.setModelOptions({ ...vm.preference.modelOptions, chunking_enabled: checked })
+	}
+
 	return (
 		<div className="space-y-5">
 			<SectionCard>
 				<LanguageInput />
+			</SectionCard>
+			<SectionCard>
+				<div className="flex flex-wrap items-center justify-between gap-3 py-1">
+					<div className="min-w-0 flex-1">
+						<p className="text-sm font-medium">{isPortuguese ? 'Proteção para arquivos longos' : 'Long-file protection'}</p>
+						<p className="mt-1 text-xs leading-relaxed text-muted-foreground">
+							{isPortuguese
+								? 'Transcreve em blocos de até 30 segundos, reinicia o contexto entre blocos, detecta repetições e recompõe os timestamps automaticamente.'
+								: 'Transcribes in chunks of up to 30 seconds, resets context between chunks, detects repetition, and rebuilds timestamps automatically.'}
+						</p>
+					</div>
+					<Switch checked={chunkingEnabled} onCheckedChange={setChunkingEnabled} />
+				</div>
+				{chunkingEnabled && vm.preference.diarizeEnabled && (
+					<p className="mt-3 border-t border-border/45 pt-3 text-xs text-muted-foreground">
+						{isPortuguese
+							? 'A proteção é desativada automaticamente durante a diarização para não misturar a identidade dos locutores entre blocos.'
+							: 'Protection is automatically bypassed during speaker diarization to avoid mixing speaker identities across chunks.'}
+					</p>
+				)}
 			</SectionCard>
 			<SectionCard>
 				<div className="flex flex-wrap items-center justify-between gap-2 border-b border-border/45 py-2">
