@@ -5,7 +5,6 @@ use crate::transcript::{Segment, Transcript};
 use eyre::Result;
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
-use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicBool, AtomicI64, Ordering},
@@ -15,9 +14,8 @@ use tauri::{Emitter, Listener, State};
 use tokio::sync::Mutex;
 
 use super::chunking::{
-    detect_silences, extract_chunk, globalize_segments, is_repetition_suspicious, merge_segments,
-    plan_chunks, probe_duration_seconds, repetition_score, sanitize_pathological_repetitions,
-    split_window, ChunkWindow, CHUNKING_MIN_DURATION_SECONDS, DEFAULT_CHUNK_SECONDS,
+    detect_silences, extract_chunk, globalize_segments, merge_segments, plan_chunks,
+    probe_duration_seconds, ChunkWindow, CHUNKING_MIN_DURATION_SECONDS, DEFAULT_CHUNK_SECONDS,
 };
 use super::{ui::set_progress_bar, CommandError};
 
@@ -241,20 +239,18 @@ async fn transcribe_chunked(
         return Ok(Vec::new());
     }
 
-    let initial_windows = plan_chunks(media_duration, &silences);
+    let windows = plan_chunks(media_duration, &silences);
     tracing::info!(
         "chunked transcription enabled: duration={:.2}s chunks={} request_ceiling={}s",
         media_duration,
-        initial_windows.len(),
+        windows.len(),
         DEFAULT_CHUNK_SECONDS
     );
 
-    let mut queue: VecDeque<ChunkWindow> = initial_windows.into_iter().collect();
     let mut accepted_segments = Vec::new();
-    // Store thousandths of a percent so retries cannot make fractional progress move backwards.
     let reported_progress = AtomicI64::new(0);
 
-    while let Some(window) = queue.pop_front() {
+    for window in windows {
         if abort_atomic.load(Ordering::Relaxed) {
             tracing::debug!("chunked transcription aborted by user");
             break;
@@ -284,34 +280,9 @@ async fn transcribe_chunked(
             tracing::debug!("failed to remove temporary chunk {}: {error}", chunk_path.display());
         }
 
-        let mut local_segments = transcription?;
+        let local_segments = transcription?;
         if abort_atomic.load(Ordering::Relaxed) {
             break;
-        }
-
-        let score = repetition_score(&local_segments);
-        if is_repetition_suspicious(&local_segments) {
-            if let Some((left, right)) = split_window(window, media_duration) {
-                tracing::warn!(
-                    "repetition loop detected in {:.2}-{:.2}s (score {:.3}); retrying as {:.2}s + {:.2}s model requests",
-                    window.owner_start,
-                    window.owner_end,
-                    score,
-                    left.extract_duration(),
-                    right.extract_duration()
-                );
-                queue.push_front(right);
-                queue.push_front(left);
-                continue;
-            }
-
-            tracing::warn!(
-                "repetition remained at retry floor in {:.2}-{:.2}s (score {:.3}); collapsing pathological duplicates",
-                window.owner_start,
-                window.owner_end,
-                score
-            );
-            local_segments = sanitize_pathological_repetitions(local_segments);
         }
 
         let global_segments = globalize_segments(local_segments, window, media_duration);
