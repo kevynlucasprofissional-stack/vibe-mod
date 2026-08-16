@@ -19,6 +19,7 @@ export interface AdvancedTranscribeOptions {
 	includeSubFolders: boolean
 	skipIfExists: boolean
 	saveNextToAudioFile: boolean
+	chunkingEnabled: boolean
 }
 
 // Define the type of preference
@@ -174,6 +175,7 @@ export function PreferenceProvider({ children }: { children: ReactNode }) {
 		includeSubFolders: false,
 		saveNextToAudioFile: true,
 		skipIfExists: true,
+		chunkingEnabled: true,
 	})
 
 	const [recentLanguages, setRecentLanguages] = useLocalStorage<{ code: string; ts: number }[]>('prefs_recent_languages', [])
@@ -262,6 +264,10 @@ export function PreferenceProvider({ children }: { children: ReactNode }) {
 		setStoreRecordInDocuments(defaultOptions.storeRecordInDocuments)
 		setCustomRecordingPath(null)
 		setLlmConfig(defaultOptions.llmConfig)
+		setAdvancedTranscribeOptions({
+			...advancedTranscribeOptions,
+			chunkingEnabled: true,
+		})
 		message(m.successAction())
 	}
 
