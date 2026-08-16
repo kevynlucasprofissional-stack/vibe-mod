@@ -2,10 +2,11 @@ use crate::ffmpeg::{find_ffmpeg_path, get_vibe_temp_folder, random_string};
 use crate::transcript::Segment;
 use eyre::{bail, Context, ContextCompat, Result};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-
-#[cfg(windows)]
-use std::os::windows::process::CommandExt;
+use std::process::{ExitStatus, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
+use tokio::io::AsyncReadExt;
+use tokio::process::{Child, Command};
 
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
@@ -33,16 +34,44 @@ impl ChunkWindow {
 fn configure_command(cmd: &mut Command) {
     cmd.stdin(Stdio::null());
     #[cfg(windows)]
-    cmd.creation_flags(CREATE_NO_WINDOW);
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.as_std_mut().creation_flags(CREATE_NO_WINDOW);
+    }
 }
 
-pub fn probe_duration_seconds(input: &Path) -> Result<f64> {
+async fn wait_for_command(mut child: Child, abort: &AtomicBool) -> Result<(ExitStatus, String)> {
+    loop {
+        if abort.load(Ordering::Relaxed) {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            bail!("ffmpeg command aborted");
+        }
+
+        if let Some(status) = child.try_wait().context("failed to poll ffmpeg process")? {
+            let mut stderr = String::new();
+            if let Some(mut pipe) = child.stderr.take() {
+                pipe.read_to_string(&mut stderr)
+                    .await
+                    .context("failed to read ffmpeg stderr")?;
+            }
+            return Ok((status, stderr));
+        }
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+pub async fn probe_duration_seconds(input: &Path, abort: &AtomicBool) -> Result<f64> {
     let ffmpeg = find_ffmpeg_path().context("ffmpeg not found")?;
     let mut cmd = Command::new(ffmpeg);
-    cmd.args(["-hide_banner", "-i"]).arg(input);
+    cmd.args(["-hide_banner", "-i"])
+        .arg(input)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
     configure_command(&mut cmd);
-    let output = cmd.output().context("failed to probe media duration with ffmpeg")?;
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let child = cmd.spawn().context("failed to probe media duration with ffmpeg")?;
+    let (_status, stderr) = wait_for_command(child, abort).await?;
     parse_duration(&stderr).context("ffmpeg did not report a finite media duration")
 }
 
@@ -70,7 +99,7 @@ pub fn plan_chunks(duration: f64) -> Vec<ChunkWindow> {
     windows
 }
 
-pub fn extract_chunk(input: &Path, window: ChunkWindow) -> Result<PathBuf> {
+pub async fn extract_chunk(input: &Path, window: ChunkWindow, abort: &AtomicBool) -> Result<PathBuf> {
     if window.duration() > DEFAULT_CHUNK_SECONDS + 0.001 {
         bail!(
             "planned transcription chunk exceeds {:.1}s ceiling: {:.3}s",
@@ -101,12 +130,30 @@ pub fn extract_chunk(input: &Path, window: ChunkWindow) -> Result<PathBuf> {
             "pcm_s16le",
             "-y",
         ])
-        .arg(&output_path);
+        .arg(&output_path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
     configure_command(&mut cmd);
-    let output = cmd.output().context("failed to extract transcription chunk")?;
-    if !output.status.success() || !output_path.exists() {
+
+    let child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            let _ = std::fs::remove_file(&output_path);
+            return Err(error).context("failed to spawn ffmpeg chunk extraction");
+        }
+    };
+
+    let (status, stderr) = match wait_for_command(child, abort).await {
+        Ok(result) => result,
+        Err(error) => {
+            let _ = std::fs::remove_file(&output_path);
+            return Err(error).context("ffmpeg chunk extraction did not complete");
+        }
+    };
+
+    if !status.success() || !output_path.exists() {
         let _ = std::fs::remove_file(&output_path);
-        bail!("ffmpeg chunk extraction failed: {}", String::from_utf8_lossy(&output.stderr));
+        bail!("ffmpeg chunk extraction failed: {stderr}");
     }
     Ok(output_path)
 }
