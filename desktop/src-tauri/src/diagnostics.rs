@@ -89,11 +89,15 @@ impl DiagnosticsState {
     pub fn new(app: &tauri::AppHandle) -> Result<Self> {
         let root = app.path().app_config_dir()?.join("diagnostics");
         fs::create_dir_all(&root).context("failed to create diagnostics directory")?;
+        let latest_report = newest_report(&root);
         Ok(Self {
-            latest_report: newest_report(&root),
-            raw_log_path: crate::logging::get_log_path(app).ok(),
-            app_snapshot: app_snapshot(app),
             root,
+            app_snapshot: app_snapshot(app),
+            raw_log_path: crate::logging::get_log_path(app).ok(),
+            store: Mutex::new(DiagnosticsStore {
+                active: HashMap::new(),
+                latest_report,
+            }),
         })
     }
 
@@ -292,21 +296,6 @@ impl DiagnosticsState {
                     store.latest_report = Some(run.report_dir.join(format!("{}.json", run.run_id)));
                 }
             }
-        }
-    }
-}
-
-impl DiagnosticsState {
-    fn build(root: PathBuf, app_snapshot: Value, raw_log_path: Option<PathBuf>) -> Self {
-        let latest_report = newest_report(&root);
-        Self {
-            root,
-            app_snapshot,
-            raw_log_path,
-            store: Mutex::new(DiagnosticsStore {
-                active: HashMap::new(),
-                latest_report,
-            }),
         }
     }
 }
@@ -793,7 +782,7 @@ fn truncate(value: &str, max_chars: usize) -> String {
 }
 
 fn markdown_cell(value: &str) -> String {
-    value.replace('|', "\\|").replace(['\n', '\r'], " ")
+    value.replace('|', "\\|").replace('\n', " ").replace('\r', " ")
 }
 
 fn newest_report(root: &Path) -> Option<PathBuf> {
