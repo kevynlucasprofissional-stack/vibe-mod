@@ -5,6 +5,7 @@ import { useLocalStorage } from 'usehooks-ts'
 import { Claude, type Llm, Ollama, OpenAICompatible } from '~/lib/llm'
 import * as transcript from '~/lib/transcript'
 import { usePreferenceProvider } from '~/providers/preference'
+import { finishDiagnosticRun, normalizeError, recordDiagnosticEvent, startDiagnosticRun } from '~/lib/diagnostics'
 
 export function useSummarization() {
 	const preference = usePreferenceProvider()
@@ -21,8 +22,33 @@ export function useSummarization() {
 	async function summarize(source: transcript.Segment[], prompt: string, showSummary = false) {
 		if (!llm) return
 		setSummarizing(true)
+		const startedAt = performance.now()
+		let diagnosticRunId: string | null = null
+		try {
+			diagnosticRunId = await startDiagnosticRun('home_summary', {
+				provider: preference.llmConfig.platform,
+				model: preference.llmConfig.model,
+				source_segment_count: source.length,
+				source_character_count: transcript.asText(source, m.speakerPrefix()).length,
+				prompt_template_length: prompt.length,
+				show_summary_after_completion: showSummary,
+			})
+		} catch (error) {
+			console.error('failed to initialize summary diagnostics', error)
+		}
+
 		try {
 			const question = prompt.replace('%s', transcript.asText(source, m.speakerPrefix()))
+			if (diagnosticRunId) {
+				await recordDiagnosticEvent(
+					diagnosticRunId,
+					'summary.request_started',
+					'Sending transcript to the configured LLM summarizer',
+					{ question_length: question.length },
+					'info',
+					'llm',
+				)
+			}
 			const answerPromise = llm.ask(question)
 			toast.promise(answerPromise, {
 				loading: m.summarizeLoading(),
@@ -34,8 +60,29 @@ export function useSummarization() {
 				setSegments([{ start: 0, stop: source[source.length - 1]?.stop ?? 0, text: answer }])
 				if (showSummary) setTranscriptTab('summary')
 			}
+			if (diagnosticRunId) {
+				await finishDiagnosticRun(diagnosticRunId, 'succeeded', {
+					answer_present: Boolean(answer),
+					answer_length: answer?.length ?? 0,
+					elapsed_ms: Math.round(performance.now() - startedAt),
+				})
+			}
 		} catch (error) {
 			console.error(error)
+			if (diagnosticRunId) {
+				await recordDiagnosticEvent(
+					diagnosticRunId,
+					'summary.request_failed',
+					'LLM summarization failed',
+					{ error: normalizeError(error) },
+					'error',
+					'llm',
+				).catch(console.error)
+				await finishDiagnosticRun(diagnosticRunId, 'failed', {
+					error: normalizeError(error),
+					elapsed_ms: Math.round(performance.now() - startedAt),
+				}).catch(console.error)
+			}
 		} finally {
 			setSummarizing(false)
 		}
