@@ -8,6 +8,7 @@ on:
         paths:
             - '.github/workflows/lint_rust.yml'
             - 'desktop/src-tauri/**'
+            - 'desktop/src/**'
             - 'cli/src/**'
             - 'scripts/chunking_benchmark.py'
             - 'scripts/test_chunking_benchmark.py'
@@ -66,6 +67,7 @@ jobs:
             - name: install node deps
               run: pnpm install
               working-directory: ./desktop
+
             - name: build react
               run: pnpm build
               working-directory: ./desktop
@@ -77,6 +79,14 @@ jobs:
 
             - name: run chunking tests
               run: cargo test --manifest-path Cargo.toml chunking
+
+            - name: run diagnostics tests
+              run: |
+                  cargo test --manifest-path Cargo.toml diagnostics
+                  cargo test --manifest-path Cargo.toml process_tests
+                  cargo test --manifest-path Cargo.toml cli_stderr_buffer_keeps_recent_utf8
+                  cargo test --manifest-path Cargo.toml diagnostic_url_summary
+                  cargo test --manifest-path Cargo.toml clear_model_state_removes_runtime_metadata
 
             - name: validate benchmark scripts
               run: |
