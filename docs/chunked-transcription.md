@@ -1,113 +1,188 @@
-# Resilient 30-second transcription
+# Audited long-file transcription protection
 
-Vibe can protect long transcriptions from decoder loops by splitting the media into short, independent transcription requests while keeping one continuous output timeline.
+This branch protects long **Whisper** transcriptions from context-propagated repetition loops by sending independent requests to Sona while preserving a continuous output timeline.
 
-## Defaults
+The design in this document is the result of an audit of the first PR implementation. It intentionally removes mechanisms that were not proven safe.
 
-- Protection is enabled by default through `modelOptions.chunking_enabled`.
-- Files of 30 seconds or less keep the original single-request path; every longer file enters the protected chunk pipeline.
-- **Thirty seconds is a hard ceiling for the audio sent to the model**, including contextual overlap.
-- Normal ownership windows target 28 seconds. With up to 1 second of context on each side, interior Sona requests are at most 30 seconds.
-- The planner looks for a silence in the last 2 seconds before an ownership boundary and may cut a little earlier.
-- Overlap is context only. An ownership window decides which segments are accepted.
-- The Sona model remains loaded. Only transcription context is reset by issuing a new `/v1/audio/transcriptions` request for each chunk.
-- The previous chunk transcript is never injected as a prompt. A user-supplied `init_prompt` is still preserved.
+## What the audit established
 
-## Pipeline
+### Why separate requests help Whisper
 
-1. Probe media duration.
-2. Bypass chunking for files of 30 seconds or less, or for speaker diarization.
-3. Detect silence positions with FFmpeg. If this analysis fails, fall back to fixed boundaries that still respect the 30-second request ceiling.
-4. Build ownership windows and extraction windows so every model request, overlap included, is at most 30 seconds.
-5. Extract one temporary 16 kHz mono PCM WAV at a time.
-6. Transcribe sequentially using the already-loaded Sona model.
-7. Score the chunk for pathological repetition.
-8. When repetition is detected, discard that result and retry the same ownership range as two smaller chunks.
-9. Adaptive requests shrink from at most 30s to at most 15s and then at most 7.5s. At the retry floor, collapse consecutive pathological duplicates instead of allowing an infinite retry loop.
-10. Convert local chunk timestamps back to the original media timeline.
-11. Keep only segments owned by the current window, merge all accepted segments, and remove sufficiently long near-duplicate boundary segments while preserving legitimate short repetitions such as “yes / yes”.
-12. Return one normal Vibe `Transcript`, so TXT/SRT/VTT/JSON/CSV/DOCX exporters continue to work without chunk awareness.
+Sona v0.3.5 keeps the model loaded but each Whisper request begins with fresh transcription context. Within one long Whisper request, however, previous-window text can condition later windows. That is the propagation path this feature is intended to break.
 
-## Progress and cancellation
+For that reason, the desktop flow limits external Whisper requests to **at most 30 seconds**.
 
-Sona reports progress per request. Vibe maps each request back to the corresponding position in the original file, so the UI sees one global 0-100% operation rather than repeated 0-100% cycles. Progress is stored at thousandths-of-a-percent precision and clamped so adaptive retries do not move the UI backwards. Chunked progress cannot report 100% before validation and merging complete; the final 100% is emitted only after the accepted chunk queue finishes.
+### Why this is not applied to every engine
 
-Only one `abort_transcribe` listener is registered for an operation, and it is explicitly removed when the command finishes. Cancellation prevents subsequent chunks from being scheduled and temporary chunks are removed after each attempt. The implementation also checks cancellation around the initial media-analysis stage.
+Sona v0.3.5 already performs native VAD chunking for Nemotron and Parakeet, with a 30-second maximum chunk duration. Adding a second Vibe-side cut layer was not justified by the audit.
 
-## Speaker diarization
+The backend records Sona's reported model engine when a model is loaded:
 
-Chunk protection currently falls back to the original full-file path when speaker diarization is enabled. Speaker numbers are local inference identities and cannot safely be assumed to identify the same person in separate requests. Stable timestamps and VAD remain compatible and are forwarded to every chunk.
+- `whisper`: external desktop protection may run;
+- `nemotron`: use Sona-native chunking;
+- `parakeet`: use Sona-native chunking;
+- unknown/custom metadata: treated conservatively as Whisper-compatible.
 
-A future diarization implementation should perform explicit cross-chunk speaker embedding matching before chunking is enabled for that mode.
+## Current Whisper pipeline
 
-## Repetition detector
+For a Whisper model with protection enabled and diarization disabled:
 
-The detector combines three signals and uses the strongest one:
+1. Probe the media duration.
+2. Files of 30 seconds or less use the normal single-request path.
+3. Longer files are planned as fixed requests of at most 30 seconds.
+4. Neighboring requests start 28 seconds apart, creating a 2-second shared audio region.
+5. Each request is extracted as 16 kHz mono PCM WAV.
+6. Sona remains loaded; each chunk is sent as an independent `/v1/audio/transcriptions` request.
+7. Chunk-local timestamps are shifted back to the source-media timeline.
+8. All overlap output is preserved initially.
+9. Two segments are collapsed only when they have:
+   - exactly equal normalized text;
+   - the same speaker value;
+   - a real positive temporal overlap.
+10. Ambiguous boundary variants are kept rather than guessed away.
+11. The merged result is returned as one normal Vibe `Transcript`.
 
-- consecutive identical segments;
-- a single segment dominating the chunk three or more times;
-- repeated word trigrams across the chunk.
+## What was deliberately removed
 
-A score of 0.65 or greater triggers adaptive retry. The retry result is evaluated again before it is accepted.
+The first implementation included several additional mechanisms. The audit did not find sufficient evidence to keep them in the production path.
 
-## Validation framework
+### Midpoint ownership
 
-Development follows a gated loop for each change:
+Removed because two neighboring requests can segment a boundary phrase differently and both midpoint tests can reject it, deleting real speech.
 
-**Implement -> verify -> adjust -> validate -> move to the next implementation.**
+### Whole-file silence detection
 
-The Rust unit tests cover:
+Removed because it is not necessary for complete temporal coverage. Fixed overlapping windows cover the whole file without requiring thresholds for dB level, silence duration or lookback distance.
 
-- FFmpeg duration parsing;
-- hard 30-second model-request ceiling including overlap;
-- silence-aware cuts;
-- overlap semantics;
-- global timestamp reconstruction;
-- loop detection;
-- healthy-text false-positive protection;
-- boundary deduplication;
-- preservation of legitimate short repetition;
-- adaptive <=30 -> <=15 -> <=7.5 second retries.
+Silence-aware cutting may still be useful as a future quality optimization, but it needs real-model evidence before returning.
 
-Use the benchmark script to compare a known problematic file with protection disabled and enabled:
+### Text-based repetition detector and adaptive retry
+
+Removed from production. Legitimate repeated speech can look identical to a decoder loop when only transcript text is examined.
+
+The earlier detector could flag legitimate repeated phrases and the retry-floor sanitizer could delete real occurrences. Repetition metrics remain useful for diagnostics, but they are not allowed to delete transcript content.
+
+### Fuzzy boundary deduplication
+
+Removed. Similar text near a boundary is not enough evidence that one copy is false. The merge now only collapses exact normalized text with actual time overlap.
+
+## Diarization
+
+External Whisper chunking is **not used when diarization is enabled**.
+
+In Sona v0.3.5, diarization runs on the audio in each request and exposes request-local speaker IDs. The API does not expose a global speaker identity/embedding that Vibe can safely use to reconcile `Speaker 1` across independent requests.
+
+The desktop UI states this limitation explicitly. A diarized Whisper run therefore uses the normal full-file path and should not be described as protected by this feature.
+
+## Product scope
+
+This implementation lives in the Vibe desktop `transcribe` orchestrator.
+
+Covered desktop flows:
+
+- Home file transcription;
+- files produced by recording and then sent through Home transcription;
+- downloaded/link media that enters the Home transcription flow;
+- Batch transcription.
+
+Not covered by this Vibe-side orchestrator:
+
+- CLI mode, which forwards arguments directly to the bundled Sona binary;
+- the local HTTP API, which exposes Sona directly;
+- agent skills that call the Sona HTTP API directly.
+
+A product-wide version of this behavior would be cleaner if Sona exposed an explicit Whisper option equivalent to disabling previous-window text conditioning. Sona v0.3.5 does not expose that option.
+
+## Benchmark policy
+
+`scripts/chunking_benchmark.py` no longer treats lower repetition as proof of better transcription.
+
+Without a reference transcript it reports only diagnostics and returns:
+
+`quality_verdict = inconclusive_without_reference`
+
+It reports:
+
+- word/segment counts;
+- adjacent duplicates;
+- dominant repeated segments;
+- repeated trigrams;
+- aggregate repetition score;
+- timestamp validity;
+- ordering;
+- first/last timestamps;
+- temporal span and maximum inter-segment gap.
+
+With a human/reference transcript it additionally reports:
+
+- WER;
+- CER;
+- word substitutions;
+- word insertions;
+- word deletions/omissions.
+
+`--fail-on-regression` requires `--reference`. The gate fails when the protected transcript has worse WER/CER, more word omissions, more word insertions, or structurally invalid timestamps.
+
+Examples:
 
 ```bash
 python scripts/chunking_benchmark.py full.json chunked.json
 ```
 
-With a human/reference transcript:
+Diagnostic only; no quality winner is declared.
 
 ```bash
 python scripts/chunking_benchmark.py full.json chunked.json --reference reference.txt
 ```
 
-For automated regression checks:
+Reference-backed comparison.
 
 ```bash
 python scripts/chunking_benchmark.py full.json chunked.json --reference reference.txt --fail-on-regression
 ```
 
-The comparison reports adjacent duplicates, dominant repeated segments, repeated trigrams, an aggregate repetition score, and optional word error rate (WER).
+Reference-backed regression gate.
 
-## Real-file acceptance matrix
+## Parameters that remain hypotheses
 
-Before declaring the feature empirically production-ready, validate at least:
+The following values are implementation defaults, not empirically optimized conclusions:
 
-- 20-30 second audio: unchanged original path;
-- 30-60 second audio: protected path, request ceiling respected, continuous timestamps;
-- 1-5 minute speech: chunked path and continuous timestamps;
-- 30-60 minute speech: no repeated-loop tail;
-- multi-hour audio/video: stable memory and temporary-file cleanup;
-- speech crossing a chunk boundary;
-- long silence around a boundary;
-- music/noise around a boundary;
-- stable timestamps enabled;
-- VAD-required model;
-- CPU transcription;
-- GPU transcription;
-- cancellation during a chunk;
-- Batch mode;
-- TXT, SRT, VTT, JSON, CSV and DOCX exports;
-- diarization enabled: confirmed full-file fallback.
+- request ceiling: 30 seconds has a technical basis in Whisper windowing and context isolation;
+- shared boundary audio: 2 seconds is retained as a conservative overlap, but its optimal value is not yet established.
 
-For the original failure mode, the acceptance criterion is that 30-second protection materially lowers the repetition score without increasing WER on a representative set of long files.
+Do not claim that 2 seconds is optimal until real-model experiments compare alternatives.
+
+## Validation completed without a real model runtime
+
+The audit validated:
+
+- independent Sona requests reset relevant decoder state;
+- Whisper long-request context can propagate between internal windows;
+- Nemotron/Parakeet already have Sona-native chunking;
+- fixed 30-second windows with 2-second overlap cover arbitrary durations without gaps;
+- generated FFmpeg cuts have the requested lengths;
+- conservative merge preserves the reproduced boundary-loss case;
+- legitimate sequential repeated phrases are not removed by the merge;
+- a no-reference benchmark cannot approve an empty transcript as a quality improvement.
+
+## Remaining empirical gates
+
+This branch must **not** be called production-ready based only on the checks above.
+
+Still required on a machine with the real app/model runtime:
+
+1. Rust formatter/build/check/clippy/test.
+2. Frontend build/typecheck.
+3. Real Vibe → FFmpeg → Sona → model → merge → export integration.
+4. A/B/C accuracy comparison using a file that reproduces the original loop:
+   - A: original full-file behavior;
+   - B: first PR implementation before audit corrections;
+   - C: audited implementation.
+5. A reference-backed quality comparison when possible.
+6. Boundary-focused listening/ground-truth checks.
+7. CPU and GPU runs.
+8. Runtime and resource measurements for long files.
+9. Cancellation while an FFmpeg chunk extraction is active.
+10. Export checks for TXT, JSON, SRT, VTT, CSV and DOCX.
+
+Until those gates pass, the correct release status is **not ready for merge**.
