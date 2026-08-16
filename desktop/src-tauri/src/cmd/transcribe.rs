@@ -176,8 +176,12 @@ async fn transcribe_inner(
         .await;
     }
 
-    let media_duration = match probe_duration_seconds(audio_path) {
+    let media_duration = match probe_duration_seconds(audio_path, abort_atomic).await {
         Ok(duration) => duration,
+        Err(error) if abort_atomic.load(Ordering::Relaxed) => {
+            tracing::debug!("Whisper duration probe aborted: {error:?}");
+            return Ok(Vec::new());
+        }
         Err(error) => {
             tracing::warn!("unable to probe duration for Whisper chunking, using normal transcription: {error:?}");
             return transcribe_stream_collect(
@@ -248,7 +252,15 @@ async fn transcribe_chunked(
             break;
         }
 
-        let chunk_path = extract_chunk(audio_path, window).map_err(CommandError::from)?;
+        let chunk_path = match extract_chunk(audio_path, window, abort_atomic).await {
+            Ok(path) => path,
+            Err(error) if abort_atomic.load(Ordering::Relaxed) => {
+                tracing::debug!("active FFmpeg chunk extraction aborted: {error:?}");
+                break;
+            }
+            Err(error) => return Err(CommandError::from(error)),
+        };
+
         let mut chunk_options = options.clone();
         chunk_options.path = chunk_path.to_string_lossy().to_string();
         chunk_options.chunking_enabled = Some(false);
