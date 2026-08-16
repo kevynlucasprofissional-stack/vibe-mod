@@ -164,6 +164,7 @@ pub fn extract_chunk(input: &Path, window: ChunkWindow) -> Result<PathBuf> {
     configure_command(&mut cmd);
     let output = cmd.output().context("failed to extract transcription chunk")?;
     if !output.status.success() || !output_path.exists() {
+        let _ = std::fs::remove_file(&output_path);
         bail!("ffmpeg chunk extraction failed: {}", String::from_utf8_lossy(&output.stderr));
     }
     Ok(output_path)
@@ -379,7 +380,7 @@ mod tests {
     #[test]
     fn globalizes_and_keeps_only_owned_segments() {
         let window = ChunkWindow { owner_start: 30.0, owner_end: 60.0, extract_start: 29.0, extract_end: 61.0, depth: 0 };
-        let local = vec![segment(50, 150, "left overlap"), segment(200, 300, "owned"), segment(3100, 3200, "right overlap")];
+        let local = vec![segment(0, 50, "left overlap"), segment(200, 300, "owned"), segment(3100, 3200, "right overlap")];
         let global = globalize_segments(local, window, 90.0);
         assert_eq!(global.len(), 1);
         assert_eq!(global[0].start, 3100);
