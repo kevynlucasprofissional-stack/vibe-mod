@@ -56,8 +56,6 @@ pub struct TranscribeOptions {
     pub stable_timestamps: Option<bool>,
     pub vad_model: Option<String>,
     pub chunking_enabled: Option<bool>,
-    /// Optional parent diagnostics run. Batch uses this to aggregate all files
-    /// into one report. When absent, `transcribe` creates and finalizes its own run.
     pub diagnostic_run_id: Option<String>,
     pub diagnostic_item_id: Option<String>,
     pub diagnostic_source: Option<String>,
@@ -148,7 +146,7 @@ pub async fn transcribe(
         return Err(error);
     }
 
-    let (client, base_url, model_engine) = {
+    let (client, base_url, model_engine, loaded_model_path, gpu_device, gpu_fallback) = {
         let state = sona_state.lock().await;
         let Some(process) = state.process.as_ref() else {
             let error = CommandError {
@@ -166,7 +164,14 @@ pub async fn transcribe(
             );
             return Err(error);
         };
-        (process.client(), process.base_url(), state.model_engine.clone())
+        (
+            process.client(),
+            process.base_url(),
+            state.model_engine.clone(),
+            state.loaded_model_path.clone(),
+            state.gpu_device,
+            state.gpu_fallback,
+        )
     };
 
     let abort_atomic = Arc::new(AtomicBool::new(false));
@@ -186,8 +191,11 @@ pub async fn transcribe(
         "transcription.model_ready",
         "Sona process and model are available",
         json!({
-            "engine": model_engine,
-            "base_url": base_url,
+            "engine": model_engine.as_deref(),
+            "model_path": loaded_model_path.as_deref(),
+            "gpu_device": gpu_device,
+            "gpu_fallback": gpu_fallback,
+            "base_url": base_url.as_str(),
         }),
     );
 
@@ -278,6 +286,27 @@ pub async fn transcribe(
             })
         }
         Err(error) => {
+            if let Some(run_id) = diagnostic_run_id.as_deref() {
+                let recent_stderr = {
+                    let state = sona_state.lock().await;
+                    state
+                        .process
+                        .as_ref()
+                        .map(crate::sona::SonaProcess::recent_stderr)
+                        .unwrap_or_default()
+                };
+                if !recent_stderr.is_empty() {
+                    diag_event(
+                        &diagnostics,
+                        Some(run_id),
+                        "error",
+                        "sona",
+                        "transcription.sona_stderr",
+                        "Recent Sona stderr captured after transcription failure",
+                        json!({ "recent_stderr": recent_stderr }),
+                    );
+                }
+            }
             finalize_failure(
                 &diagnostics,
                 diagnostic_run_id.as_deref(),
@@ -606,8 +635,6 @@ async fn transcribe_chunked(
         let mut chunk_options = options.clone();
         chunk_options.path = chunk_path.to_string_lossy().to_string();
         chunk_options.chunking_enabled = Some(false);
-        // Child requests stay associated with the same diagnostic run but never
-        // create recursive reports because SonaProcess receives fields explicitly.
 
         let transcription = transcribe_stream_collect(
             app_handle,
@@ -844,7 +871,7 @@ fn finalize_failure(
 }
 
 fn command_error_value(error: &CommandError) -> Value {
-    json!({ "code": error.code, "message": error.message })
+    json!({ "code": error.code.as_str(), "message": error.message.as_str() })
 }
 
 fn map_sona_error(error: eyre::Report) -> CommandError {
