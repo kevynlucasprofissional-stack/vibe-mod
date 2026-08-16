@@ -4,6 +4,7 @@ use crate::{cmd::app::get_logs_folder, config, logging::get_log_path};
 use eyre::{eyre, ContextCompat, Result};
 use std::path::Path;
 use std::time::{Duration, SystemTime};
+use tauri::Manager;
 
 const RAW_LOG_RETENTION_DAYS: u64 = 14;
 const DIAGNOSTIC_RETENTION_DAYS: u64 = 30;
