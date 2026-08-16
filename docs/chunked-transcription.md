@@ -5,7 +5,7 @@ Vibe can protect long transcriptions from decoder loops by splitting the media i
 ## Defaults
 
 - Protection is enabled by default through `modelOptions.chunking_enabled`.
-- Files shorter than 35 seconds keep the original single-request path.
+- Files of 30 seconds or less keep the original single-request path; every longer file enters the protected chunk pipeline.
 - **Thirty seconds is a hard ceiling for the audio sent to the model**, including contextual overlap.
 - Normal ownership windows target 28 seconds. With up to 1 second of context on each side, interior Sona requests are at most 30 seconds.
 - The planner looks for a silence in the last 2 seconds before an ownership boundary and may cut a little earlier.
@@ -16,7 +16,7 @@ Vibe can protect long transcriptions from decoder loops by splitting the media i
 ## Pipeline
 
 1. Probe media duration.
-2. Bypass chunking for short files or speaker diarization.
+2. Bypass chunking for files of 30 seconds or less, or for speaker diarization.
 3. Detect silence positions with FFmpeg. If this analysis fails, fall back to fixed boundaries that still respect the 30-second request ceiling.
 4. Build ownership windows and extraction windows so every model request, overlap included, is at most 30 seconds.
 5. Extract one temporary 16 kHz mono PCM WAV at a time.
@@ -94,6 +94,7 @@ The comparison reports adjacent duplicates, dominant repeated segments, repeated
 Before declaring the feature empirically production-ready, validate at least:
 
 - 20-30 second audio: unchanged original path;
+- 30-60 second audio: protected path, request ceiling respected, continuous timestamps;
 - 1-5 minute speech: chunked path and continuous timestamps;
 - 30-60 minute speech: no repeated-loop tail;
 - multi-hour audio/video: stable memory and temporary-file cleanup;
