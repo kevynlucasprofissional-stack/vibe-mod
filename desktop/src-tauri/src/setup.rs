@@ -56,7 +56,7 @@ pub fn setup(app: &App) -> Result<(), Box<dyn std::error::Error>> {
 
     let previous_panic_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |panic_info| {
-        let message = format!("Rust panic: {panic_info}");
+        let message = format!("Rust panic: {panic_info:?}");
         if let Ok(app_guard) = STATIC_APP.lock() {
             if let Some(app_handle) = app_guard.as_ref() {
                 app_handle.state::<DiagnosticsState>().record_crash_best_effort(&message);
