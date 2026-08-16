@@ -66,12 +66,43 @@ export async function showLatestDiagnosticReport() {
 }
 
 export function normalizeError(error: unknown) {
+	if (error instanceof Error) {
+		return {
+			name: error.name,
+			message: error.message,
+			stack: error.stack,
+		}
+	}
 	if (typeof error === 'object' && error !== null) {
 		const value = error as Record<string, unknown>
 		return {
 			code: value.code,
 			message: value.message ?? String(error),
+			stack: value.stack,
 		}
 	}
 	return { message: String(error) }
+}
+
+export async function captureUnexpectedFrontendFailure(kind: 'window_error' | 'unhandled_rejection', error: unknown, metadata: Record<string, unknown> = {}) {
+	try {
+		const runId = await startDiagnosticRun('frontend_failure', {
+			kind,
+			error: normalizeError(error),
+			...metadata,
+		})
+		await recordDiagnosticEvent(
+			runId,
+			`frontend.${kind}`,
+			'Unexpected frontend failure escaped normal operation handling',
+			{ error: normalizeError(error), ...metadata },
+			'error',
+			'frontend',
+		)
+		await finishDiagnosticRun(runId, 'failed', { kind, error: normalizeError(error), ...metadata })
+	} catch (diagnosticError) {
+		// Never throw from the global failure reporter or it could create a
+		// recursive unhandled-rejection loop while the app is already unhealthy.
+		console.error('failed to persist unexpected frontend diagnostic', diagnosticError)
+	}
 }
