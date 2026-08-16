@@ -5,6 +5,8 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 
+const SONA_STDERR_DIAGNOSTIC_BYTES: usize = 16 * 1024;
+
 impl SonaProcess {
     pub fn spawn(binary_path: &Path, ffmpeg_path: Option<&Path>, unload_timeout_minutes: u32) -> Result<Self> {
         tracing::debug!("spawning sona at {}", binary_path.display());
@@ -83,9 +85,8 @@ impl SonaProcess {
                 while reader.read_line(&mut line).unwrap_or(0) > 0 {
                     tracing::debug!("sona stderr: {}", line.trim());
                     if let Ok(mut buf) = buf_clone.lock() {
-                        if buf.len() < 8192 {
-                            buf.push_str(&line);
-                        }
+                        buf.push_str(&line);
+                        trim_front_to_recent_utf8(&mut buf, SONA_STDERR_DIAGNOSTIC_BYTES);
                     }
                     line.clear();
                 }
@@ -117,7 +118,7 @@ impl SonaProcess {
         self.unload_timeout_minutes
     }
 
-    fn recent_stderr(&self) -> String {
+    pub fn recent_stderr(&self) -> String {
         self.stderr_buf.lock().map(|buf| buf.trim().to_string()).unwrap_or_default()
     }
 
@@ -170,8 +171,33 @@ impl SonaProcess {
     }
 }
 
+fn trim_front_to_recent_utf8(buffer: &mut String, max_bytes: usize) {
+    if buffer.len() <= max_bytes {
+        return;
+    }
+    let mut start = buffer.len().saturating_sub(max_bytes);
+    while start < buffer.len() && !buffer.is_char_boundary(start) {
+        start += 1;
+    }
+    buffer.drain(..start);
+}
+
 impl Drop for SonaProcess {
     fn drop(&mut self) {
         self.kill();
+    }
+}
+
+#[cfg(test)]
+mod process_tests {
+    use super::*;
+
+    #[test]
+    fn stderr_buffer_keeps_recent_utf8_without_splitting_characters() {
+        let mut buffer = format!("{}{}", "a".repeat(100), "á".repeat(20));
+        trim_front_to_recent_utf8(&mut buffer, 25);
+        assert!(buffer.len() <= 25);
+        assert!(std::str::from_utf8(buffer.as_bytes()).is_ok());
+        assert!(buffer.ends_with('á'));
     }
 }
