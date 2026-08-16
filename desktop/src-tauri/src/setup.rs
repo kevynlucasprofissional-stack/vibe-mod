@@ -17,10 +17,10 @@ pub static STATIC_APP: Lazy<std::sync::Mutex<Option<tauri::AppHandle>>> = Lazy::
 
 pub struct SonaState {
     pub process: Option<SonaProcess>,
-    /// Engine reported by Sona metadata for the model currently loaded through
-    /// the desktop GUI. `None` is kept for unknown/custom models and is treated
-    /// conservatively as Whisper-compatible by the chunk-protection layer.
     pub model_engine: Option<String>,
+    pub loaded_model_path: Option<String>,
+    pub gpu_device: Option<i32>,
+    pub gpu_fallback: bool,
 }
 
 pub fn setup(app: &App) -> Result<(), Box<dyn std::error::Error>> {
@@ -34,19 +34,18 @@ pub fn setup(app: &App) -> Result<(), Box<dyn std::error::Error>> {
     app.manage(Mutex::new(SonaState {
         process: None,
         model_engine: None,
+        loaded_model_path: None,
+        gpu_device: None,
+        gpu_fallback: false,
     }));
     app.manage(crate::dictation_indicator::DictationIndicatorRuntime::default());
 
     let store = app.store(STORE_FILENAME)?;
-
     {
         let mut app_handle = STATIC_APP.lock().expect("lock");
         *app_handle = Some(app.handle().clone());
     }
     crate::logging::setup_logging(app.handle(), store).unwrap();
-
-    // Structured diagnostics are initialized after tracing so every diagnostic
-    // report can point back to the raw log for complementary evidence.
     app.manage(DiagnosticsState::new(app.handle())?);
 
     crate::cleaner::clean_old_logs(app.handle()).log_error();
@@ -55,9 +54,6 @@ pub fn setup(app: &App) -> Result<(), Box<dyn std::error::Error>> {
     crate::cleaner::clean_updater_files().log_error();
     tracing::debug!("Vibe App Running");
 
-    // Rust panics are recorded into every active diagnostic run before the
-    // normal panic hook continues. try_lock is used inside diagnostics so a
-    // panic while diagnostics itself is writing cannot deadlock the process.
     let previous_panic_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |panic_info| {
         let message = format!("Rust panic: {panic_info}");
@@ -73,15 +69,12 @@ pub fn setup(app: &App) -> Result<(), Box<dyn std::error::Error>> {
         crash_handler::make_crash_event(move |cc: &crash_handler::CrashContext| {
             #[cfg(windows)]
             let info = cc.exception_code;
-
             #[cfg(target_os = "macos")]
             let info = cc.exception;
-
             #[cfg(target_os = "linux")]
             let info = cc.siginfo;
 
             tracing::error!("Crash context: {:?}", info);
-
             if let Ok(app_guard) = STATIC_APP.lock() {
                 if let Some(app_handle) = app_guard.as_ref() {
                     app_handle
@@ -97,7 +90,6 @@ pub fn setup(app: &App) -> Result<(), Box<dyn std::error::Error>> {
                     let _ = tauri_plugin_opener::open_url(get_issue_url(format!("{info:?}")), None::<&str>);
                 }
             }
-
             crash_handler::CrashEventResult::Handled(true)
         })
     });
@@ -105,7 +97,6 @@ pub fn setup(app: &App) -> Result<(), Box<dyn std::error::Error>> {
     if let Ok(version) = tauri::webview_version() {
         tracing::debug!("webview version: {}", version);
     }
-
     #[cfg(windows)]
     {
         if let Err(error) = crate::custom_protocol::register() {
