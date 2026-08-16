@@ -19,7 +19,6 @@ export interface AdvancedTranscribeOptions {
 	includeSubFolders: boolean
 	skipIfExists: boolean
 	saveNextToAudioFile: boolean
-	chunkingEnabled: boolean
 }
 
 // Define the type of preference
@@ -113,6 +112,7 @@ export interface ModelOptions {
 	sampling_strategy: 'greedy' | 'beam search'
 	best_of?: number
 	beam_size?: number
+	chunking_enabled?: boolean
 }
 
 const systemIsDark = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches
@@ -134,6 +134,7 @@ const defaultOptions = {
 		sampling_strategy: 'beam search' as 'greedy' | 'beam search',
 		best_of: 5,
 		beam_size: 5,
+		chunking_enabled: true,
 	},
 	ffmpegOptions: {
 		normalize_loudness: false,
@@ -175,7 +176,6 @@ export function PreferenceProvider({ children }: { children: ReactNode }) {
 		includeSubFolders: false,
 		saveNextToAudioFile: true,
 		skipIfExists: true,
-		chunkingEnabled: true,
 	})
 
 	const [recentLanguages, setRecentLanguages] = useLocalStorage<{ code: string; ts: number }[]>('prefs_recent_languages', [])
@@ -264,10 +264,6 @@ export function PreferenceProvider({ children }: { children: ReactNode }) {
 		setStoreRecordInDocuments(defaultOptions.storeRecordInDocuments)
 		setCustomRecordingPath(null)
 		setLlmConfig(defaultOptions.llmConfig)
-		setAdvancedTranscribeOptions({
-			...advancedTranscribeOptions,
-			chunkingEnabled: true,
-		})
 		message(m.successAction())
 	}
 
