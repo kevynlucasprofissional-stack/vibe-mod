@@ -82,6 +82,7 @@ export function useTranscription({ onResetSummary, onSummarize }: UseTranscripti
 		abortRef.current = false
 		let completedSegments: transcript.Segment[] = []
 		let transcriptionSeconds = 0
+		let transcriptionSucceeded = false
 		let diagnosticFinalized = false
 		trackAnalyticsEvent(analyticsEvents.TRANSCRIBE_STARTED, { source: 'home' })
 
@@ -118,6 +119,7 @@ export function useTranscription({ onResetSummary, onSummarize }: UseTranscripti
 			const startedAt = performance.now()
 			const result = await invoke<transcript.Transcript>('transcribe', { options })
 			transcriptionSeconds = Math.round((performance.now() - startedAt) / 1000)
+			transcriptionSucceeded = true
 			console.info(`Transcribe took ${transcriptionSeconds} seconds.`)
 			completedSegments = result.segments
 			setSegments(result.segments)
@@ -177,19 +179,26 @@ export function useTranscription({ onResetSummary, onSummarize }: UseTranscripti
 			}
 		}
 
-		if (completedSegments.length > 0) {
+		if (transcriptionSucceeded && diagnosticRunId && !diagnosticFinalized) {
 			let summarySucceeded = true
-			if (preferenceRef.current.llmConfig.enabled) {
-				summarySucceeded = await onSummarize(completedSegments, preferenceRef.current.llmConfig.prompt, diagnosticRunId ?? undefined)
+			const summaryEligible = preferenceRef.current.llmConfig.enabled && completedSegments.length > 0
+			if (summaryEligible) {
+				summarySucceeded = await onSummarize(completedSegments, preferenceRef.current.llmConfig.prompt, diagnosticRunId)
+			} else if (preferenceRef.current.llmConfig.enabled && completedSegments.length === 0) {
+				await record(
+					'home.summary_skipped_empty_transcript',
+					'Automatic summary was skipped because the transcription returned no segments',
+					{},
+					'warning',
+				)
 			}
-			if (diagnosticRunId && !diagnosticFinalized) {
-				await finishDiagnosticRun(diagnosticRunId, summarySucceeded ? 'succeeded' : 'partial', {
-					transcription_seconds: transcriptionSeconds,
-					segments: completedSegments.length,
-					summary_enabled: preferenceRef.current.llmConfig.enabled,
-					summary_succeeded: summarySucceeded,
-				}).catch(console.error)
-			}
+			await finishDiagnosticRun(diagnosticRunId, summarySucceeded ? 'succeeded' : 'partial', {
+				transcription_seconds: transcriptionSeconds,
+				segments: completedSegments.length,
+				summary_enabled: preferenceRef.current.llmConfig.enabled,
+				summary_attempted: summaryEligible,
+				summary_succeeded: summarySucceeded,
+			}).catch(console.error)
 		}
 	}
 
