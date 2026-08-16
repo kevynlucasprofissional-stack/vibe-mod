@@ -73,7 +73,7 @@ export function useTranscription({ onResetSummary, onSummarize }: UseTranscripti
 			const options = {
 				path,
 				...current.modelOptions,
-				chunking_enabled: current.advancedTranscribeOptions.chunkingEnabled !== false,
+				chunking_enabled: current.modelOptions.chunking_enabled !== false,
 				...(diarizeModel ? { diarize_model: diarizeModel } : {}),
 				...(vadModel ? { vad_model: vadModel } : {}),
 				...(current.stableTimestampsEnabled ? { stable_timestamps: true } : {}),
