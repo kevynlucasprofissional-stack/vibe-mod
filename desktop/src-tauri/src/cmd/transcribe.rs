@@ -5,14 +5,20 @@ use crate::transcript::{Segment, Transcript};
 use eyre::Result;
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::collections::VecDeque;
+use std::path::{Path, PathBuf};
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicI64, Ordering},
     Arc,
 };
 use tauri::{Emitter, Listener, State};
 use tokio::sync::Mutex;
 
+use super::chunking::{
+    detect_silences, extract_chunk, globalize_segments, is_repetition_suspicious, merge_segments,
+    plan_chunks, probe_duration_seconds, repetition_score, sanitize_pathological_repetitions,
+    split_window, ChunkWindow, CHUNKING_MIN_DURATION_SECONDS, DEFAULT_CHUNK_SECONDS,
+};
 use super::{ui::set_progress_bar, CommandError};
 
 #[allow(dead_code)]
@@ -49,6 +55,17 @@ pub struct TranscribeOptions {
     pub diarize_model: Option<String>,
     pub stable_timestamps: Option<bool>,
     pub vad_model: Option<String>,
+    pub chunking_enabled: Option<bool>,
+}
+
+#[derive(Clone, Copy)]
+enum ProgressMode {
+    Direct,
+    Chunked {
+        owner_start: f64,
+        owner_duration: f64,
+        media_duration: f64,
+    },
 }
 
 #[tauri::command]
@@ -57,20 +74,8 @@ pub async fn transcribe(
     options: TranscribeOptions,
     sona_state: State<'_, Mutex<SonaState>>,
 ) -> Result<Transcript, CommandError> {
-    // Validate file exists before attempting transcription
     let audio_path = PathBuf::from(&options.path);
-    if !audio_path.exists() {
-        return Err(CommandError {
-            code: "invalid_request".to_string(),
-            message: format!("Audio file not found: {}", options.path),
-        });
-    }
-    if !audio_path.is_file() {
-        return Err(CommandError {
-            code: "invalid_request".to_string(),
-            message: format!("Path is not a file: {}", options.path),
-        });
-    }
+    validate_audio_path(&audio_path, &options.path)?;
 
     let (client, base_url) = {
         let state = sona_state.lock().await;
@@ -79,32 +84,253 @@ pub async fn transcribe(
             message: "Please load model first".to_string(),
         })?;
         (process.client(), process.base_url())
-    }; // lock released here, before any I/O
+    };
 
     let abort_atomic = Arc::new(AtomicBool::new(false));
     let abort_atomic_c = abort_atomic.clone();
-
     let app_handle_c = app_handle.clone();
-    app_handle.listen("abort_transcribe", move |_| {
+    let listener_id = app_handle.listen("abort_transcribe", move |_| {
         let _ = set_progress_bar(&app_handle_c, None);
         abort_atomic_c.store(true, Ordering::Relaxed);
     });
 
-    let start = std::time::Instant::now();
+    let started_at = std::time::Instant::now();
+    let result = transcribe_inner(
+        &app_handle,
+        &client,
+        &base_url,
+        &audio_path,
+        &options,
+        &abort_atomic,
+    )
+    .await;
 
-    let stream = crate::sona::SonaProcess::transcribe_stream(&client, &base_url, &options)
-        .await
-        .map_err(|e| {
-            if let Some(api_err) = e.downcast_ref::<crate::sona::SonaApiError>() {
-                CommandError {
-                    code: api_err.code.clone(),
-                    message: api_err.message.clone(),
-                }
-            } else {
-                CommandError::from(e)
+    app_handle.unlisten(listener_id);
+    let _ = set_progress_bar(&app_handle, None);
+
+    result.map(|segments| Transcript {
+        processing_time_sec: started_at.elapsed().as_secs(),
+        segments,
+    })
+}
+
+fn validate_audio_path(audio_path: &Path, original: &str) -> Result<(), CommandError> {
+    if !audio_path.exists() {
+        return Err(CommandError {
+            code: "invalid_request".to_string(),
+            message: format!("Audio file not found: {original}"),
+        });
+    }
+    if !audio_path.is_file() {
+        return Err(CommandError {
+            code: "invalid_request".to_string(),
+            message: format!("Path is not a file: {original}"),
+        });
+    }
+    Ok(())
+}
+
+async fn transcribe_inner(
+    app_handle: &tauri::AppHandle,
+    client: &reqwest::Client,
+    base_url: &str,
+    audio_path: &Path,
+    options: &TranscribeOptions,
+    abort_atomic: &AtomicBool,
+) -> Result<Vec<Segment>, CommandError> {
+    let chunking_enabled = options.chunking_enabled.unwrap_or(true);
+    let diarization_enabled = options
+        .diarize_model
+        .as_deref()
+        .is_some_and(|model| !model.trim().is_empty());
+
+    if chunking_enabled && diarization_enabled {
+        tracing::warn!(
+            "30-second chunk protection is disabled for this run because cross-chunk speaker identity is not yet safe"
+        );
+        return transcribe_stream_collect(
+            app_handle,
+            client,
+            base_url,
+            options,
+            abort_atomic,
+            ProgressMode::Direct,
+            None,
+        )
+        .await;
+    }
+
+    if !chunking_enabled {
+        return transcribe_stream_collect(
+            app_handle,
+            client,
+            base_url,
+            options,
+            abort_atomic,
+            ProgressMode::Direct,
+            None,
+        )
+        .await;
+    }
+
+    let media_duration = match probe_duration_seconds(audio_path) {
+        Ok(duration) => duration,
+        Err(error) => {
+            tracing::warn!("unable to probe duration for chunking, using normal transcription: {error:?}");
+            return transcribe_stream_collect(
+                app_handle,
+                client,
+                base_url,
+                options,
+                abort_atomic,
+                ProgressMode::Direct,
+                None,
+            )
+            .await;
+        }
+    };
+
+    if media_duration < CHUNKING_MIN_DURATION_SECONDS {
+        return transcribe_stream_collect(
+            app_handle,
+            client,
+            base_url,
+            options,
+            abort_atomic,
+            ProgressMode::Direct,
+            None,
+        )
+        .await;
+    }
+
+    transcribe_chunked(
+        app_handle,
+        client,
+        base_url,
+        audio_path,
+        options,
+        abort_atomic,
+        media_duration,
+    )
+    .await
+}
+
+async fn transcribe_chunked(
+    app_handle: &tauri::AppHandle,
+    client: &reqwest::Client,
+    base_url: &str,
+    audio_path: &Path,
+    options: &TranscribeOptions,
+    abort_atomic: &AtomicBool,
+    media_duration: f64,
+) -> Result<Vec<Segment>, CommandError> {
+    let silences = match detect_silences(audio_path, media_duration) {
+        Ok(silences) => silences,
+        Err(error) => {
+            tracing::warn!("silence-aware cut detection failed, using exact 30-second boundaries: {error:?}");
+            Vec::new()
+        }
+    };
+    let initial_windows = plan_chunks(media_duration, &silences);
+    tracing::info!(
+        "chunked transcription enabled: duration={:.2}s chunks={} target={}s",
+        media_duration,
+        initial_windows.len(),
+        DEFAULT_CHUNK_SECONDS
+    );
+
+    let mut queue: VecDeque<ChunkWindow> = initial_windows.into_iter().collect();
+    let mut accepted_segments = Vec::new();
+    let reported_progress = AtomicI64::new(0);
+
+    while let Some(window) = queue.pop_front() {
+        if abort_atomic.load(Ordering::Relaxed) {
+            tracing::debug!("chunked transcription aborted by user");
+            break;
+        }
+
+        let chunk_path = extract_chunk(audio_path, window).map_err(CommandError::from)?;
+        let mut chunk_options = options.clone();
+        chunk_options.path = chunk_path.to_string_lossy().to_string();
+        chunk_options.chunking_enabled = Some(false);
+
+        let transcription = transcribe_stream_collect(
+            app_handle,
+            client,
+            base_url,
+            &chunk_options,
+            abort_atomic,
+            ProgressMode::Chunked {
+                owner_start: window.owner_start,
+                owner_duration: window.owner_duration(),
+                media_duration,
+            },
+            Some(&reported_progress),
+        )
+        .await;
+
+        if let Err(error) = std::fs::remove_file(&chunk_path) {
+            tracing::debug!("failed to remove temporary chunk {}: {error}", chunk_path.display());
+        }
+
+        let mut local_segments = transcription?;
+        if abort_atomic.load(Ordering::Relaxed) {
+            break;
+        }
+
+        let score = repetition_score(&local_segments);
+        if is_repetition_suspicious(&local_segments) {
+            if let Some((left, right)) = split_window(window, media_duration) {
+                tracing::warn!(
+                    "repetition loop detected in {:.2}-{:.2}s (score {:.3}); retrying as {:.2}s + {:.2}s",
+                    window.owner_start,
+                    window.owner_end,
+                    score,
+                    left.owner_duration(),
+                    right.owner_duration()
+                );
+                queue.push_front(right);
+                queue.push_front(left);
+                continue;
             }
-        })?;
 
+            tracing::warn!(
+                "repetition remained at retry floor in {:.2}-{:.2}s (score {:.3}); collapsing pathological duplicates",
+                window.owner_start,
+                window.owner_end,
+                score
+            );
+            local_segments = sanitize_pathological_repetitions(local_segments);
+        }
+
+        let global_segments = globalize_segments(local_segments, window, media_duration);
+        for segment in &global_segments {
+            app_handle
+                .emit_to("main", "new_segment", segment.clone())
+                .log_error();
+        }
+        accepted_segments.extend(global_segments);
+    }
+
+    if !abort_atomic.load(Ordering::Relaxed) {
+        let _ = set_progress_bar(app_handle, Some(100.0));
+    }
+
+    Ok(merge_segments(accepted_segments))
+}
+
+async fn transcribe_stream_collect(
+    app_handle: &tauri::AppHandle,
+    client: &reqwest::Client,
+    base_url: &str,
+    options: &TranscribeOptions,
+    abort_atomic: &AtomicBool,
+    progress_mode: ProgressMode,
+    reported_progress: Option<&AtomicI64>,
+) -> Result<Vec<Segment>, CommandError> {
+    let stream = crate::sona::SonaProcess::transcribe_stream(client, base_url, options)
+        .await
+        .map_err(map_sona_error)?;
     tokio::pin!(stream);
 
     let mut segments = Vec::new();
@@ -119,7 +345,7 @@ pub async fn transcribe(
         match event_result {
             Ok(event) => match event {
                 SonaEvent::Progress { progress } => {
-                    let _ = set_progress_bar(&app_handle, Some(progress.into()));
+                    update_progress(app_handle, progress, progress_mode, reported_progress);
                 }
                 SonaEvent::Segment {
                     start,
@@ -133,31 +359,30 @@ pub async fn transcribe(
                         text,
                         speaker,
                     };
-                    app_handle.emit_to("main", "new_segment", segment.clone()).log_error();
+                    if matches!(progress_mode, ProgressMode::Direct) {
+                        app_handle
+                            .emit_to("main", "new_segment", segment.clone())
+                            .log_error();
+                    }
                     segments.push(segment);
                 }
                 SonaEvent::Result { .. } => {
-                    tracing::debug!("transcription complete");
                     completed = true;
                 }
                 SonaEvent::Error { code, message } => {
                     tracing::error!("sona transcription error: {}", message);
-                    let _ = set_progress_bar(&app_handle, None);
                     return Err(CommandError {
                         code: code.unwrap_or_else(|| "internal_error".to_string()),
                         message,
                     });
                 }
             },
-            Err(e) => {
-                tracing::error!("stream error: {:?}", e);
-                let _ = set_progress_bar(&app_handle, None);
-                return Err(CommandError::from(e));
+            Err(error) => {
+                tracing::error!("stream error: {:?}", error);
+                return Err(CommandError::from(error));
             }
         }
     }
-
-    let _ = set_progress_bar(&app_handle, None);
 
     if !abort_atomic.load(Ordering::Relaxed) && !completed {
         return Err(CommandError {
@@ -166,11 +391,44 @@ pub async fn transcribe(
         });
     }
 
-    let elapsed = start.elapsed();
-    let transcript = Transcript {
-        processing_time_sec: elapsed.as_secs(),
-        segments,
+    Ok(segments)
+}
+
+fn update_progress(
+    app_handle: &tauri::AppHandle,
+    progress: i32,
+    mode: ProgressMode,
+    reported_progress: Option<&AtomicI64>,
+) {
+    let progress = progress.clamp(0, 100) as f64;
+    let mapped = match mode {
+        ProgressMode::Direct => progress,
+        ProgressMode::Chunked {
+            owner_start,
+            owner_duration,
+            media_duration,
+        } => ((owner_start + owner_duration * (progress / 100.0)) / media_duration * 100.0)
+            .clamp(0.0, 100.0),
     };
 
-    Ok(transcript)
+    if let Some(reported) = reported_progress {
+        let candidate = mapped.round() as i64;
+        let previous = reported.fetch_max(candidate, Ordering::Relaxed);
+        if candidate < previous {
+            return;
+        }
+    }
+
+    let _ = set_progress_bar(app_handle, Some(mapped));
+}
+
+fn map_sona_error(error: eyre::Report) -> CommandError {
+    if let Some(api_error) = error.downcast_ref::<crate::sona::SonaApiError>() {
+        CommandError {
+            code: api_error.code.clone(),
+            message: api_error.message.clone(),
+        }
+    } else {
+        CommandError::from(error)
+    }
 }
