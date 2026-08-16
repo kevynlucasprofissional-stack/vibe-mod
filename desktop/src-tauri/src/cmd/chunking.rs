@@ -11,11 +11,12 @@ use std::os::windows::process::CommandExt;
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
+/// Hard ceiling for every normal transcription request sent to Sona.
 pub const DEFAULT_CHUNK_SECONDS: f64 = 30.0;
 pub const DEFAULT_OVERLAP_SECONDS: f64 = 1.0;
 pub const CHUNKING_MIN_DURATION_SECONDS: f64 = 35.0;
-pub const MIN_RETRY_CHUNK_SECONDS: f64 = 7.5;
 pub const MAX_RETRY_DEPTH: u8 = 2;
+const BASE_OWNER_SECONDS: f64 = DEFAULT_CHUNK_SECONDS - (DEFAULT_OVERLAP_SECONDS * 2.0);
 const SILENCE_LOOKBACK_SECONDS: f64 = 2.0;
 const SILENCE_NOISE_DB: &str = "-35dB";
 const SILENCE_MIN_SECONDS: &str = "0.25";
@@ -39,6 +40,10 @@ pub struct ChunkWindow {
 impl ChunkWindow {
     pub fn owner_duration(&self) -> f64 {
         (self.owner_end - self.owner_start).max(0.0)
+    }
+
+    pub fn extract_duration(&self) -> f64 {
+        (self.extract_end - self.extract_start).max(0.0)
     }
 }
 
@@ -80,8 +85,8 @@ pub fn plan_chunks(duration: f64, silences: &[SilenceRange]) -> Vec<ChunkWindow>
 
     let mut windows = Vec::new();
     let mut owner_start = 0.0;
-    while duration - owner_start > DEFAULT_CHUNK_SECONDS {
-        let target = (owner_start + DEFAULT_CHUNK_SECONDS).min(duration);
+    while duration - owner_start > BASE_OWNER_SECONDS {
+        let target = (owner_start + BASE_OWNER_SECONDS).min(duration);
         let minimum_cut = (target - SILENCE_LOOKBACK_SECONDS).max(owner_start + 1.0);
         let owner_end = best_silence_cut(silences, minimum_cut, target).unwrap_or(target);
         let owner_end = if owner_end <= owner_start + 0.1 { target } else { owner_end };
@@ -95,10 +100,13 @@ pub fn plan_chunks(duration: f64, silences: &[SilenceRange]) -> Vec<ChunkWindow>
 }
 
 pub fn split_window(window: ChunkWindow, media_duration: f64) -> Option<(ChunkWindow, ChunkWindow)> {
-    if window.owner_duration() <= MIN_RETRY_CHUNK_SECONDS || window.depth >= MAX_RETRY_DEPTH {
+    if window.depth >= MAX_RETRY_DEPTH {
         return None;
     }
     let midpoint = window.owner_start + window.owner_duration() / 2.0;
+    if midpoint <= window.owner_start || midpoint >= window.owner_end {
+        return None;
+    }
     let next_depth = window.depth + 1;
     Some((
         make_window(window.owner_start, midpoint, media_duration, next_depth),
@@ -106,12 +114,17 @@ pub fn split_window(window: ChunkWindow, media_duration: f64) -> Option<(ChunkWi
     ))
 }
 
+fn overlap_for_depth(depth: u8) -> f64 {
+    DEFAULT_OVERLAP_SECONDS / 2_f64.powi(i32::from(depth))
+}
+
 fn make_window(owner_start: f64, owner_end: f64, media_duration: f64, depth: u8) -> ChunkWindow {
+    let overlap = overlap_for_depth(depth);
     ChunkWindow {
         owner_start,
         owner_end,
-        extract_start: (owner_start - DEFAULT_OVERLAP_SECONDS).max(0.0),
-        extract_end: (owner_end + DEFAULT_OVERLAP_SECONDS).min(media_duration),
+        extract_start: (owner_start - overlap).max(0.0),
+        extract_end: (owner_end + overlap).min(media_duration),
         depth,
     }
 }
@@ -138,10 +151,18 @@ fn best_silence_cut(silences: &[SilenceRange], minimum_cut: f64, target: f64) ->
 }
 
 pub fn extract_chunk(input: &Path, window: ChunkWindow) -> Result<PathBuf> {
+    if window.extract_duration() > DEFAULT_CHUNK_SECONDS + 0.001 {
+        bail!(
+            "planned transcription chunk exceeds {:.1}s ceiling: {:.3}s",
+            DEFAULT_CHUNK_SECONDS,
+            window.extract_duration()
+        );
+    }
+
     let ffmpeg = find_ffmpeg_path().context("ffmpeg not found")?;
     let output_path = get_vibe_temp_folder().join(format!("chunk_{}.wav", random_string(12)));
     let start = format!("{:.3}", window.extract_start);
-    let duration = format!("{:.3}", (window.extract_end - window.extract_start).max(0.01));
+    let duration = format!("{:.3}", window.extract_duration().max(0.01));
 
     let mut cmd = Command::new(ffmpeg);
     cmd.args(["-hide_banner", "-loglevel", "error", "-nostdin", "-ss", &start, "-i"])
@@ -200,7 +221,10 @@ pub fn repetition_score(segments: &[Segment]) -> f64 {
         return 0.0;
     }
 
-    let adjacent_duplicates = normalized.windows(2).filter(|pair| pair[0] == pair[1] && pair[0].len() >= 6).count();
+    let adjacent_duplicates = normalized
+        .windows(2)
+        .filter(|pair| pair[0] == pair[1] && pair[0].len() >= 6)
+        .count();
     let adjacent_ratio = adjacent_duplicates as f64 / (normalized.len() - 1) as f64;
 
     let mut frequencies: HashMap<&str, usize> = HashMap::new();
@@ -218,7 +242,7 @@ pub fn repetition_score(segments: &[Segment]) -> f64 {
 
     let tokens: Vec<&str> = normalized.iter().flat_map(|text| text.split_whitespace()).collect();
     let ngram_ratio = if tokens.len() >= 12 {
-        let trigrams: Vec<String> = tokens.windows(3).map(|w| w.join(" ")).collect();
+        let trigrams: Vec<String> = tokens.windows(3).map(|window| window.join(" ")).collect();
         let unique = trigrams.iter().collect::<HashSet<_>>().len();
         1.0 - unique as f64 / trigrams.len() as f64
     } else {
@@ -252,8 +276,11 @@ pub fn merge_segments(mut segments: Vec<Segment>) -> Vec<Segment> {
     let mut merged: Vec<Segment> = Vec::with_capacity(segments.len());
     for segment in segments {
         let duplicate = merged.last().is_some_and(|previous| {
+            let previous_text = normalize_text(&previous.text);
+            let current_text = normalize_text(&segment.text);
+            let enough_content = previous_text.len().min(current_text.len()) >= 8;
             let close_in_time = segment.start <= previous.stop.saturating_add(150);
-            close_in_time && text_similarity(&previous.text, &segment.text) >= 0.90
+            enough_content && close_in_time && text_similarity(&previous_text, &current_text) >= 0.90
         });
         if !duplicate {
             merged.push(segment);
@@ -323,14 +350,20 @@ fn parse_silences(stderr: &str, duration: f64) -> Vec<SilenceRange> {
         if let Some(value) = parse_metric(line, "silence_end:") {
             if let Some(start) = current_start.take() {
                 if value > start {
-                    ranges.push(SilenceRange { start, end: value.min(duration) });
+                    ranges.push(SilenceRange {
+                        start,
+                        end: value.min(duration),
+                    });
                 }
             }
         }
     }
     if let Some(start) = current_start {
         if duration > start {
-            ranges.push(SilenceRange { start, end: duration });
+            ranges.push(SilenceRange {
+                start,
+                end: duration,
+            });
         }
     }
     ranges
@@ -346,7 +379,12 @@ mod tests {
     use super::*;
 
     fn segment(start: i64, stop: i64, text: &str) -> Segment {
-        Segment { start, stop, text: text.to_string(), speaker: None }
+        Segment {
+            start,
+            stop,
+            text: text.to_string(),
+            speaker: None,
+        }
     }
 
     #[test]
@@ -356,18 +394,26 @@ mod tests {
     }
 
     #[test]
-    fn plans_chunks_at_or_below_thirty_seconds() {
+    fn every_model_request_is_at_most_thirty_seconds_including_overlap() {
         let windows = plan_chunks(95.0, &[]);
         assert_eq!(windows.len(), 4);
-        assert!(windows.iter().all(|window| window.owner_duration() <= 30.0));
+        assert!(windows
+            .iter()
+            .all(|window| window.extract_duration() <= DEFAULT_CHUNK_SECONDS + 0.001));
         assert_eq!(windows.last().unwrap().owner_end, 95.0);
     }
 
     #[test]
-    fn prefers_silence_before_target_without_exceeding_thirty_seconds() {
-        let windows = plan_chunks(70.0, &[SilenceRange { start: 28.8, end: 29.4 }]);
-        assert!((windows[0].owner_end - 29.4).abs() < f64::EPSILON);
-        assert!(windows[0].owner_duration() <= 30.0);
+    fn prefers_silence_before_owner_target_without_breaking_request_ceiling() {
+        let windows = plan_chunks(
+            70.0,
+            &[SilenceRange {
+                start: 27.1,
+                end: 27.7,
+            }],
+        );
+        assert!((windows[0].owner_end - 27.7).abs() < f64::EPSILON);
+        assert!(windows[0].extract_duration() <= DEFAULT_CHUNK_SECONDS);
     }
 
     #[test]
@@ -375,16 +421,27 @@ mod tests {
         let window = plan_chunks(65.0, &[])[1];
         assert!(window.extract_start < window.owner_start);
         assert!(window.extract_end > window.owner_end);
+        assert!(window.extract_duration() <= DEFAULT_CHUNK_SECONDS);
     }
 
     #[test]
     fn globalizes_and_keeps_only_owned_segments() {
-        let window = ChunkWindow { owner_start: 30.0, owner_end: 60.0, extract_start: 29.0, extract_end: 61.0, depth: 0 };
-        let local = vec![segment(0, 50, "left overlap"), segment(200, 300, "owned"), segment(3100, 3200, "right overlap")];
+        let window = ChunkWindow {
+            owner_start: 28.0,
+            owner_end: 56.0,
+            extract_start: 27.0,
+            extract_end: 57.0,
+            depth: 0,
+        };
+        let local = vec![
+            segment(0, 50, "left overlap"),
+            segment(200, 300, "owned"),
+            segment(2900, 3000, "right overlap"),
+        ];
         let global = globalize_segments(local, window, 90.0);
         assert_eq!(global.len(), 1);
-        assert_eq!(global[0].start, 3100);
-        assert_eq!(global[0].stop, 3200);
+        assert_eq!(global[0].start, 2900);
+        assert_eq!(global[0].stop, 3000);
     }
 
     #[test]
@@ -410,22 +467,35 @@ mod tests {
     }
 
     #[test]
-    fn merge_removes_boundary_duplicates() {
+    fn merge_removes_long_boundary_duplicates() {
         let merged = merge_segments(vec![
-            segment(2900, 3100, "we need to finish this sentence"),
-            segment(3000, 3200, "we need to finish this sentence"),
-            segment(3200, 3400, "and then continue"),
+            segment(2700, 2900, "we need to finish this sentence"),
+            segment(2800, 3000, "we need to finish this sentence"),
+            segment(3000, 3200, "and then continue"),
         ]);
         assert_eq!(merged.len(), 2);
     }
 
     #[test]
-    fn suspicious_chunk_can_be_split_until_retry_floor() {
+    fn merge_keeps_legitimate_short_repetition() {
+        let merged = merge_segments(vec![
+            segment(100, 150, "sim"),
+            segment(150, 200, "sim"),
+        ]);
+        assert_eq!(merged.len(), 2);
+    }
+
+    #[test]
+    fn suspicious_chunk_retries_as_fifteen_then_seven_and_a_half_second_requests() {
         let window = plan_chunks(60.0, &[])[0];
+        assert!((window.extract_duration() - 29.0).abs() < 0.001);
+
         let (left, right) = split_window(window, 60.0).unwrap();
-        assert!((left.owner_duration() - 15.0).abs() < 0.001);
-        assert!((right.owner_duration() - 15.0).abs() < 0.001);
-        let (quarter, _) = split_window(left, 60.0).unwrap();
+        assert!(left.extract_duration() <= 15.0 + 0.001);
+        assert!(right.extract_duration() <= 15.0 + 0.001);
+
+        let (quarter, _) = split_window(right, 60.0).unwrap();
+        assert!(quarter.extract_duration() <= 7.5 + 0.001);
         assert!(split_window(quarter, 60.0).is_none());
     }
 }
