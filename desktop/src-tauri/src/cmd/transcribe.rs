@@ -107,10 +107,21 @@ pub async fn transcribe(
     app_handle.unlisten(listener_id);
     let _ = set_progress_bar(&app_handle, None);
 
+    if abort_atomic.load(Ordering::Relaxed) {
+        return Err(aborted_error());
+    }
+
     result.map(|segments| Transcript {
         processing_time_sec: started_at.elapsed().as_secs(),
         segments,
     })
+}
+
+fn aborted_error() -> CommandError {
+    CommandError {
+        code: "aborted".to_string(),
+        message: "Transcription aborted by user".to_string(),
+    }
 }
 
 fn validate_audio_path(audio_path: &Path, original: &str) -> Result<(), CommandError> {
@@ -437,5 +448,11 @@ mod tests {
         assert!(!should_use_external_chunking(true, Some("whisper"), true));
         assert!(should_use_external_chunking(true, Some("whisper"), false));
         assert!(!should_use_external_chunking(false, Some("whisper"), false));
+    }
+
+    #[test]
+    fn abort_is_a_distinct_command_error() {
+        let error = aborted_error();
+        assert_eq!(error.code, "aborted");
     }
 }
