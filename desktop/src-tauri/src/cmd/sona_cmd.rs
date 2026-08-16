@@ -85,6 +85,7 @@ pub async fn load_model(
             tracing::warn!("cached sona process is no longer running; restarting it");
         }
         state_guard.process = None;
+        state_guard.model_engine = None;
     }
 
     if state_guard
@@ -95,6 +96,7 @@ pub async fn load_model(
         tracing::debug!(unload_timeout_minutes, "restarting sona to apply unload timeout");
         // Dropping SonaProcess kills and waits for its child process via its Drop implementation.
         state_guard.process = None;
+        state_guard.model_engine = None;
     }
 
     let spawn_sona = || -> Result<crate::sona::SonaProcess> {
@@ -134,6 +136,7 @@ pub async fn load_model(
             if let Some(mut old) = state_guard.process.take() {
                 old.kill();
             }
+            state_guard.model_engine = None;
             let process = spawn_sona().context("failed to respawn sona")?;
             state_guard.process = Some(process);
 
@@ -142,6 +145,22 @@ pub async fn load_model(
             true
         }
     };
+
+    // Keep the engine decision in the backend so Home, Batch and other desktop
+    // callers cannot accidentally diverge. Metadata failure leaves the engine
+    // unknown; the transcription layer treats unknown/custom models
+    // conservatively as Whisper-compatible.
+    state_guard.model_engine = match state_guard.process.as_ref().unwrap().model_metadata(&model_path).await {
+        Ok(metadata) => {
+            tracing::debug!(engine = %metadata.capabilities.engine, "loaded model engine");
+            Some(metadata.capabilities.engine)
+        }
+        Err(error) => {
+            tracing::warn!("unable to resolve loaded model engine: {error:?}");
+            None
+        }
+    };
+
     if gpu_fallback {
         Ok("gpu_fallback".to_string())
     } else {
@@ -164,6 +183,7 @@ pub async fn get_model_metadata(app_handle: tauri::AppHandle, model_path: String
         let binary_path = resolve_sona_binary(&app_handle)?;
         let ffmpeg_path = resolve_ffmpeg_path(&app_handle);
         state.process = Some(crate::sona::SonaProcess::spawn(&binary_path, ffmpeg_path.as_deref(), 5)?);
+        state.model_engine = None;
     }
     state.process.as_ref().unwrap().model_metadata(&model_path).await
 }
@@ -189,12 +209,14 @@ pub async fn start_api_server(
         tracing::debug!(unload_timeout_minutes, "restarting sona to apply unload timeout");
         // Dropping SonaProcess kills and waits for its child process via its Drop implementation.
         state_guard.process = None;
+        state_guard.model_engine = None;
     }
     if state_guard.process.is_none() {
         let binary_path = resolve_sona_binary(&app_handle)?;
         let ffmpeg_path = resolve_ffmpeg_path(&app_handle);
         let process = crate::sona::SonaProcess::spawn(&binary_path, ffmpeg_path.as_deref(), unload_timeout_minutes)?;
         state_guard.process = Some(process);
+        state_guard.model_engine = None;
     }
     let process = state_guard.process.as_ref().context("API server process missing")?;
     Ok(process.base_url())
@@ -205,7 +227,9 @@ pub async fn stop_api_server(sona_state: State<'_, Mutex<SonaState>>) -> Result<
     let mut state_guard = sona_state.lock().await;
     if let Some(mut process) = state_guard.process.take() {
         process.kill();
+        state_guard.model_engine = None;
         return Ok(true);
     }
+    state_guard.model_engine = None;
     Ok(false)
 }
