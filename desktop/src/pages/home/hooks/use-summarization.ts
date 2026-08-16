@@ -19,22 +19,26 @@ export function useSummarization() {
 		setLlm(config.platform === 'ollama' ? new Ollama(config) : config.platform === 'openai' ? new OpenAICompatible(config) : new Claude(config))
 	}, [preference.llmConfig])
 
-	async function summarize(source: transcript.Segment[], prompt: string, showSummary = false) {
-		if (!llm) return
+	async function summarize(source: transcript.Segment[], prompt: string, showSummary = false, parentDiagnosticRunId?: string) {
+		if (!llm) return false
 		setSummarizing(true)
 		const startedAt = performance.now()
-		let diagnosticRunId: string | null = null
-		try {
-			diagnosticRunId = await startDiagnosticRun('home_summary', {
-				provider: preference.llmConfig.platform,
-				model: preference.llmConfig.model,
-				source_segment_count: source.length,
-				source_character_count: transcript.asText(source, m.speakerPrefix()).length,
-				prompt_template_length: prompt.length,
-				show_summary_after_completion: showSummary,
-			})
-		} catch (error) {
-			console.error('failed to initialize summary diagnostics', error)
+		const ownsDiagnosticRun = !parentDiagnosticRunId
+		let diagnosticRunId: string | null = parentDiagnosticRunId ?? null
+
+		if (!diagnosticRunId) {
+			try {
+				diagnosticRunId = await startDiagnosticRun('home_summary', {
+					provider: preference.llmConfig.platform,
+					model: preference.llmConfig.model,
+					source_segment_count: source.length,
+					source_character_count: transcript.asText(source, m.speakerPrefix()).length,
+					prompt_template_length: prompt.length,
+					show_summary_after_completion: showSummary,
+				})
+			} catch (error) {
+				console.error('failed to initialize summary diagnostics', error)
+			}
 		}
 
 		try {
@@ -44,7 +48,12 @@ export function useSummarization() {
 					diagnosticRunId,
 					'summary.request_started',
 					'Sending transcript to the configured LLM summarizer',
-					{ question_length: question.length },
+					{
+						provider: preference.llmConfig.platform,
+						model: preference.llmConfig.model,
+						question_length: question.length,
+						source_segment_count: source.length,
+					},
 					'info',
 					'llm',
 				)
@@ -61,12 +70,27 @@ export function useSummarization() {
 				if (showSummary) setTranscriptTab('summary')
 			}
 			if (diagnosticRunId) {
-				await finishDiagnosticRun(diagnosticRunId, 'succeeded', {
-					answer_present: Boolean(answer),
-					answer_length: answer?.length ?? 0,
-					elapsed_ms: Math.round(performance.now() - startedAt),
-				})
+				await recordDiagnosticEvent(
+					diagnosticRunId,
+					'summary.request_completed',
+					'LLM summarization completed',
+					{
+						answer_present: Boolean(answer),
+						answer_length: answer?.length ?? 0,
+						elapsed_ms: Math.round(performance.now() - startedAt),
+					},
+					'info',
+					'llm',
+				)
+				if (ownsDiagnosticRun) {
+					await finishDiagnosticRun(diagnosticRunId, 'succeeded', {
+						answer_present: Boolean(answer),
+						answer_length: answer?.length ?? 0,
+						elapsed_ms: Math.round(performance.now() - startedAt),
+					})
+				}
 			}
+			return true
 		} catch (error) {
 			console.error(error)
 			if (diagnosticRunId) {
@@ -74,15 +98,18 @@ export function useSummarization() {
 					diagnosticRunId,
 					'summary.request_failed',
 					'LLM summarization failed',
-					{ error: normalizeError(error) },
+					{ error: normalizeError(error), elapsed_ms: Math.round(performance.now() - startedAt) },
 					'error',
 					'llm',
 				).catch(console.error)
-				await finishDiagnosticRun(diagnosticRunId, 'failed', {
-					error: normalizeError(error),
-					elapsed_ms: Math.round(performance.now() - startedAt),
-				}).catch(console.error)
+				if (ownsDiagnosticRun) {
+					await finishDiagnosticRun(diagnosticRunId, 'failed', {
+						error: normalizeError(error),
+						elapsed_ms: Math.round(performance.now() - startedAt),
+					}).catch(console.error)
+				}
 			}
+			return false
 		} finally {
 			setSummarizing(false)
 		}
