@@ -150,14 +150,16 @@ export function viewModel() {
 				chunking_enabled: preference.modelOptions.chunking_enabled !== false,
 				llm_summary_enabled: Boolean(preference.llmConfig?.enabled),
 			})
-			await Promise.all(
-				files.map((file, index) =>
-					updateDiagnosticItem(diagnosticRunId!, `file-${index + 1}`, file.name, 'queued', { path: file.path }),
-				),
-			)
 		} catch (error) {
 			console.error('failed to initialize batch diagnostics', error)
-			diagnosticRunId = null
+		}
+		if (diagnosticRunId) {
+			for (let index = 0; index < files.length; index += 1) {
+				const file = files[index]
+				await updateDiagnosticItem(diagnosticRunId, `file-${index + 1}`, file.name, 'queued', { path: file.path }).catch((error) => {
+					console.error('failed to queue diagnostic batch item', error)
+				})
+			}
 		}
 
 		const record = async (stage: string, message: string, data: Record<string, unknown> = {}, severity: 'info' | 'warning' | 'error' = 'info') => {
@@ -263,7 +265,8 @@ export function viewModel() {
 						try {
 							const question = `${preference.llmConfig.prompt.replace('%s', transcript.asText(res.segments, speakerLabel))}`
 							const answer = await llm.ask(question)
-							if (answer) llmSegments = [{ start: 0, stop: res.segments.at(-1)?.stop ?? 0, text: answer }]
+							const lastSegment = res.segments[res.segments.length - 1]
+							if (answer) llmSegments = [{ start: 0, stop: lastSegment?.stop ?? 0, text: answer }]
 							await record('batch.summary_completed', 'LLM summary completed', { item_id: itemId, produced_summary: Boolean(answer) })
 						} catch (error) {
 							await record('batch.summary_failed', 'LLM summary failed; transcript export will continue', { item_id: itemId, error: normalizeError(error) }, 'warning')
@@ -293,14 +296,14 @@ export function viewModel() {
 
 					completedCount += 1
 					localIndex += 1
-					if (diagnosticRunId) {
-						await updateDiagnosticItem(diagnosticRunId, itemId, file.name, 'succeeded', {
-							processing_seconds: total,
-							segments: res.segments.length,
-							formats,
-							summary_generated: Boolean(llmSegments),
-						}).catch(console.error)
-					}
+					await record('batch.item_completed', 'Batch item completed including exports', {
+						item_id: itemId,
+						file: file.name,
+						processing_seconds: total,
+						segments: res.segments.length,
+						formats,
+						summary_generated: Boolean(llmSegments),
+					})
 					await new Promise((resolve) => setTimeout(resolve, 100))
 					setCurrentIndex(localIndex)
 				} catch (error) {
