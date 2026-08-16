@@ -74,6 +74,7 @@ export function useTranscription({ onResetSummary, onSummarize }: UseTranscripti
 				path,
 				...current.modelOptions,
 				chunking_enabled: current.modelOptions.chunking_enabled !== false,
+				diagnostic_source: 'home',
 				...(diarizeModel ? { diarize_model: diarizeModel } : {}),
 				...(vadModel ? { vad_model: vadModel } : {}),
 				...(current.stableTimestampsEnabled ? { stable_timestamps: true } : {}),
