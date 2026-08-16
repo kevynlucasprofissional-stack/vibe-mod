@@ -1,7 +1,6 @@
 use crate::ffmpeg::{find_ffmpeg_path, get_vibe_temp_folder, random_string};
 use crate::transcript::Segment;
 use eyre::{bail, Context, ContextCompat, Result};
-use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -15,12 +14,10 @@ const CREATE_NO_WINDOW: u32 = 0x08000000;
 pub const DEFAULT_CHUNK_SECONDS: f64 = 30.0;
 pub const DEFAULT_OVERLAP_SECONDS: f64 = 1.0;
 pub const CHUNKING_MIN_DURATION_SECONDS: f64 = DEFAULT_CHUNK_SECONDS;
-pub const MAX_RETRY_DEPTH: u8 = 2;
 const BASE_OWNER_SECONDS: f64 = DEFAULT_CHUNK_SECONDS - (DEFAULT_OVERLAP_SECONDS * 2.0);
 const SILENCE_LOOKBACK_SECONDS: f64 = 2.0;
 const SILENCE_NOISE_DB: &str = "-35dB";
 const SILENCE_MIN_SECONDS: &str = "0.25";
-const REPETITION_THRESHOLD: f64 = 0.65;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SilenceRange {
@@ -90,42 +87,22 @@ pub fn plan_chunks(duration: f64, silences: &[SilenceRange]) -> Vec<ChunkWindow>
         let minimum_cut = (target - SILENCE_LOOKBACK_SECONDS).max(owner_start + 1.0);
         let owner_end = best_silence_cut(silences, minimum_cut, target).unwrap_or(target);
         let owner_end = if owner_end <= owner_start + 0.1 { target } else { owner_end };
-        windows.push(make_window(owner_start, owner_end, duration, 0));
+        windows.push(make_window(owner_start, owner_end, duration));
         owner_start = owner_end;
     }
     if owner_start < duration {
-        windows.push(make_window(owner_start, duration, duration, 0));
+        windows.push(make_window(owner_start, duration, duration));
     }
     windows
 }
 
-pub fn split_window(window: ChunkWindow, media_duration: f64) -> Option<(ChunkWindow, ChunkWindow)> {
-    if window.depth >= MAX_RETRY_DEPTH {
-        return None;
-    }
-    let midpoint = window.owner_start + window.owner_duration() / 2.0;
-    if midpoint <= window.owner_start || midpoint >= window.owner_end {
-        return None;
-    }
-    let next_depth = window.depth + 1;
-    Some((
-        make_window(window.owner_start, midpoint, media_duration, next_depth),
-        make_window(midpoint, window.owner_end, media_duration, next_depth),
-    ))
-}
-
-fn overlap_for_depth(depth: u8) -> f64 {
-    DEFAULT_OVERLAP_SECONDS / 2_f64.powi(i32::from(depth))
-}
-
-fn make_window(owner_start: f64, owner_end: f64, media_duration: f64, depth: u8) -> ChunkWindow {
-    let overlap = overlap_for_depth(depth);
+fn make_window(owner_start: f64, owner_end: f64, media_duration: f64) -> ChunkWindow {
     ChunkWindow {
         owner_start,
         owner_end,
-        extract_start: (owner_start - overlap).max(0.0),
-        extract_end: (owner_end + overlap).min(media_duration),
-        depth,
+        extract_start: (owner_start - DEFAULT_OVERLAP_SECONDS).max(0.0),
+        extract_end: (owner_end + DEFAULT_OVERLAP_SECONDS).min(media_duration),
+        depth: 0,
     }
 }
 
@@ -193,10 +170,9 @@ pub fn extract_chunk(input: &Path, window: ChunkWindow) -> Result<PathBuf> {
 
 /// Convert chunk-local timestamps back to the source-media timeline.
 ///
-/// This intentionally preserves every segment produced in the overlap. Boundary
-/// reconciliation happens later in `merge_segments`. Dropping a segment here by
-/// an ownership/midpoint rule can erase a phrase when neighboring requests split
-/// the same acoustic event differently.
+/// Every segment produced in the overlap is preserved. Boundary reconciliation
+/// happens later in `merge_segments` so a phrase cannot disappear merely because
+/// neighboring requests segmented the same acoustic event differently.
 pub fn globalize_segments(segments: Vec<Segment>, window: ChunkWindow, media_duration: f64) -> Vec<Segment> {
     let offset = (window.extract_start * 100.0).round() as i64;
     let media_end = (media_duration * 100.0).round() as i64;
@@ -211,72 +187,12 @@ pub fn globalize_segments(segments: Vec<Segment>, window: ChunkWindow, media_dur
         .collect()
 }
 
-pub fn repetition_score(segments: &[Segment]) -> f64 {
-    let normalized: Vec<String> = segments
-        .iter()
-        .map(|segment| normalize_text(&segment.text))
-        .filter(|text| !text.is_empty())
-        .collect();
-    if normalized.len() < 3 {
-        return 0.0;
-    }
-
-    let adjacent_duplicates = normalized
-        .windows(2)
-        .filter(|pair| pair[0] == pair[1] && pair[0].len() >= 6)
-        .count();
-    let adjacent_ratio = adjacent_duplicates as f64 / (normalized.len() - 1) as f64;
-
-    let mut frequencies: HashMap<&str, usize> = HashMap::new();
-    for text in &normalized {
-        if text.len() >= 6 {
-            *frequencies.entry(text.as_str()).or_default() += 1;
-        }
-    }
-    let dominant_count = frequencies.values().copied().max().unwrap_or(0);
-    let dominant_ratio = if dominant_count >= 3 {
-        dominant_count as f64 / normalized.len() as f64
-    } else {
-        0.0
-    };
-
-    let tokens: Vec<&str> = normalized.iter().flat_map(|text| text.split_whitespace()).collect();
-    let ngram_ratio = if tokens.len() >= 12 {
-        let trigrams: Vec<String> = tokens.windows(3).map(|window| window.join(" ")).collect();
-        let unique = trigrams.iter().collect::<HashSet<_>>().len();
-        1.0 - unique as f64 / trigrams.len() as f64
-    } else {
-        0.0
-    };
-
-    adjacent_ratio.max(dominant_ratio).max(ngram_ratio)
-}
-
-pub fn is_repetition_suspicious(segments: &[Segment]) -> bool {
-    repetition_score(segments) >= REPETITION_THRESHOLD
-}
-
-pub fn sanitize_pathological_repetitions(segments: Vec<Segment>) -> Vec<Segment> {
-    let mut cleaned: Vec<Segment> = Vec::with_capacity(segments.len());
-    for segment in segments {
-        let duplicate = cleaned.last().is_some_and(|previous| {
-            normalize_text(&previous.text).len() >= 6
-                && text_similarity(&previous.text, &segment.text) >= 0.94
-                && segment.start.saturating_sub(previous.stop) <= 100
-        });
-        if !duplicate {
-            cleaned.push(segment);
-        }
-    }
-    cleaned
-}
-
 /// Merge only boundary duplicates for which there is strong evidence that both
 /// requests describe the same acoustic event: equal normalized text, equal
 /// speaker identity, and a real positive temporal overlap.
 ///
-/// Ambiguous variants are deliberately preserved. A duplicate is preferable to
-/// deleting real speech when the two chunk decodes disagree.
+/// Ambiguous variants are deliberately preserved. This function never attempts
+/// to identify or delete model repetition loops.
 pub fn merge_segments(mut segments: Vec<Segment>) -> Vec<Segment> {
     segments.sort_by_key(|segment| (segment.start, segment.stop));
     let mut merged: Vec<Segment> = Vec::with_capacity(segments.len());
@@ -320,27 +236,6 @@ fn normalize_text(text: &str) -> String {
         }
     }
     normalized.trim().to_string()
-}
-
-fn text_similarity(a: &str, b: &str) -> f64 {
-    let a = normalize_text(a);
-    let b = normalize_text(b);
-    if a.is_empty() || b.is_empty() {
-        return 0.0;
-    }
-    if a == b {
-        return 1.0;
-    }
-    if (a.contains(&b) || b.contains(&a)) && a.len().min(b.len()) >= 12 {
-        return a.len().min(b.len()) as f64 / a.len().max(b.len()) as f64;
-    }
-    let a_tokens: HashSet<&str> = a.split_whitespace().collect();
-    let b_tokens: HashSet<&str> = b.split_whitespace().collect();
-    let union = a_tokens.union(&b_tokens).count();
-    if union == 0 {
-        return 0.0;
-    }
-    a_tokens.intersection(&b_tokens).count() as f64 / union as f64
 }
 
 fn parse_duration(stderr: &str) -> Option<f64> {
@@ -506,28 +401,6 @@ mod tests {
     }
 
     #[test]
-    fn detects_pathological_repetition() {
-        let segments = vec![
-            segment(0, 100, "this phrase is repeating forever"),
-            segment(100, 200, "this phrase is repeating forever"),
-            segment(200, 300, "this phrase is repeating forever"),
-            segment(300, 400, "this phrase is repeating forever"),
-        ];
-        assert!(is_repetition_suspicious(&segments));
-    }
-
-    #[test]
-    fn healthy_transcript_is_not_flagged() {
-        let segments = vec![
-            segment(0, 100, "welcome to the meeting today"),
-            segment(100, 200, "we will review the quarterly results"),
-            segment(200, 300, "after that maria will discuss hiring"),
-            segment(300, 400, "finally we will answer questions"),
-        ];
-        assert!(!is_repetition_suspicious(&segments));
-    }
-
-    #[test]
     fn merge_removes_exact_overlapping_boundary_duplicates() {
         let merged = merge_segments(vec![
             segment(2700, 2900, "we need to finish this sentence"),
@@ -539,31 +412,13 @@ mod tests {
     }
 
     #[test]
-    fn merge_keeps_legitimate_short_repetition() {
-        let merged = merge_segments(vec![segment(100, 150, "sim"), segment(150, 200, "sim")]);
-        assert_eq!(merged.len(), 2);
-    }
-
-    #[test]
-    fn merge_keeps_same_phrase_when_intervals_do_not_overlap() {
+    fn merge_keeps_legitimate_repetition_when_intervals_do_not_overlap() {
         let merged = merge_segments(vec![
             segment(100, 150, "muito obrigado a todos"),
             segment(150, 200, "muito obrigado a todos"),
+            segment(200, 250, "muito obrigado a todos"),
+            segment(250, 300, "muito obrigado a todos"),
         ]);
-        assert_eq!(merged.len(), 2);
-    }
-
-    #[test]
-    fn suspicious_chunk_retries_as_fifteen_then_seven_and_a_half_second_requests() {
-        let window = plan_chunks(60.0, &[])[0];
-        assert!((window.extract_duration() - 29.0).abs() < 0.001);
-
-        let (left, right) = split_window(window, 60.0).unwrap();
-        assert!(left.extract_duration() <= 15.0 + 0.001);
-        assert!(right.extract_duration() <= 15.0 + 0.001);
-
-        let (quarter, _) = split_window(right, 60.0).unwrap();
-        assert!(quarter.extract_duration() <= 7.5 + 0.001);
-        assert!(split_window(quarter, 60.0).is_none());
+        assert_eq!(merged.len(), 4);
     }
 }
