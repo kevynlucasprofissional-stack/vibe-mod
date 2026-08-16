@@ -1,7 +1,7 @@
 use crate::{
     cli::{self, is_cli_detected},
     config::STORE_FILENAME,
-    diagnostics::get_issue_url,
+    diagnostics::{get_issue_url, DiagnosticsState},
     error::LogError,
     sona::SonaProcess,
 };
@@ -17,10 +17,13 @@ pub static STATIC_APP: Lazy<std::sync::Mutex<Option<tauri::AppHandle>>> = Lazy::
 
 pub struct SonaState {
     pub process: Option<SonaProcess>,
+    pub model_engine: Option<String>,
+    pub loaded_model_path: Option<String>,
+    pub gpu_device: Option<i32>,
+    pub gpu_fallback: bool,
 }
 
 pub fn setup(app: &App) -> Result<(), Box<dyn std::error::Error>> {
-    // Create app directories
     let local_app_data_dir = app.path().app_local_data_dir()?;
     let app_config_dir = app.path().app_config_dir()?;
     fs::create_dir_all(&local_app_data_dir)
@@ -28,62 +31,72 @@ pub fn setup(app: &App) -> Result<(), Box<dyn std::error::Error>> {
     fs::create_dir_all(&app_config_dir)
         .unwrap_or_else(|_| panic!("cant create app config directory at {}", app_config_dir.display()));
 
-    // Manage sona state
-    app.manage(Mutex::new(SonaState { process: None }));
+    app.manage(Mutex::new(SonaState {
+        process: None,
+        model_engine: None,
+        loaded_model_path: None,
+        gpu_device: None,
+        gpu_fallback: false,
+    }));
     app.manage(crate::dictation_indicator::DictationIndicatorRuntime::default());
 
     let store = app.store(STORE_FILENAME)?;
-
-    // Setup logging to terminal
     {
         let mut app_handle = STATIC_APP.lock().expect("lock");
         *app_handle = Some(app.handle().clone());
     }
     crate::logging::setup_logging(app.handle(), store).unwrap();
+    app.manage(DiagnosticsState::new(app.handle())?);
+
     crate::cleaner::clean_old_logs(app.handle()).log_error();
+    crate::cleaner::clean_old_diagnostics(app.handle()).log_error();
     crate::cleaner::clean_old_files().log_error();
     crate::cleaner::clean_updater_files().log_error();
     tracing::debug!("Vibe App Running");
 
-    // Crash handler
+    let previous_panic_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |panic_info| {
+        let message = format!("Rust panic: {panic_info:?}");
+        if let Ok(app_guard) = STATIC_APP.lock() {
+            if let Some(app_handle) = app_guard.as_ref() {
+                app_handle.state::<DiagnosticsState>().record_crash_best_effort(&message);
+            }
+        }
+        previous_panic_hook(panic_info);
+    }));
 
     let _handler = crash_handler::CrashHandler::attach(unsafe {
         crash_handler::make_crash_event(move |cc: &crash_handler::CrashContext| {
             #[cfg(windows)]
             let info = cc.exception_code;
-
-            #[cfg(windows)]
-            tracing::error!("Crash exception code: {}", info);
-
             #[cfg(target_os = "macos")]
             let info = cc.exception;
-
             #[cfg(target_os = "linux")]
             let info = cc.siginfo;
 
-            #[cfg(unix)]
-            tracing::error!("Crash exception code: {:?}", info);
-
-            if let Some(app_handle) = STATIC_APP.lock().expect("lock").as_ref() {
-                app_handle
-                    .dialog()
-                    .message("App crashed with error. Please register to Github and then click report.")
-                    .kind(tauri_plugin_dialog::MessageDialogKind::Error)
-                    .title("Vibe Crashed")
-                    .buttons(MessageDialogButtons::OkCustom("Report".into()))
-                    .show(|_| {});
-                let _ = tauri_plugin_opener::open_url(get_issue_url(format!("{:?}", info)), None::<&str>);
+            tracing::error!("Crash context: {:?}", info);
+            if let Ok(app_guard) = STATIC_APP.lock() {
+                if let Some(app_handle) = app_guard.as_ref() {
+                    app_handle
+                        .state::<DiagnosticsState>()
+                        .record_crash_best_effort(&format!("Native crash context: {info:?}"));
+                    app_handle
+                        .dialog()
+                        .message("App crashed. A diagnostic report was saved. Click Report to open the issue form.")
+                        .kind(tauri_plugin_dialog::MessageDialogKind::Error)
+                        .title("Vibe Crashed")
+                        .buttons(MessageDialogButtons::OkCustom("Report".into()))
+                        .show(|_| {});
+                    let _ = tauri_plugin_opener::open_url(get_issue_url(format!("{info:?}")), None::<&str>);
+                }
             }
-
             crash_handler::CrashEventResult::Handled(true)
         })
     });
 
-    // Log some useful data
     if let Ok(version) = tauri::webview_version() {
         tracing::debug!("webview version: {}", version);
     }
-
     #[cfg(windows)]
     {
         if let Err(error) = crate::custom_protocol::register() {
@@ -93,7 +106,6 @@ pub fn setup(app: &App) -> Result<(), Box<dyn std::error::Error>> {
 
     tracing::debug!("AVX2: {}", crate::cmd::app::is_avx2_enabled());
     tracing::debug!("Executable Architecture: {}", std::env::consts::ARCH);
-
     tracing::debug!("APP VERSION: {}", app.package_info().version.to_string());
     tracing::debug!("COMMIT HASH: {}", env!("COMMIT_HASH"));
     tracing::debug!("App Info: {}", crate::diagnostics::get_app_info());
@@ -106,7 +118,6 @@ pub fn setup(app: &App) -> Result<(), Box<dyn std::error::Error>> {
         });
     } else {
         tracing::debug!("Non CLI mode");
-        // Create main window
         let result = tauri::WebviewWindowBuilder::new(app, "main", tauri::WebviewUrl::App("index.html".into()))
             .inner_size(800.0, 700.0)
             .min_inner_size(800.0, 700.0)

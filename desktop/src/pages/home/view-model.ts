@@ -39,7 +39,7 @@ export function viewModel() {
 			setSummarizeSegments(null)
 			setTranscriptTab('transcript')
 		},
-		onSummarize: summarize,
+		onSummarize: (source, prompt, diagnosticRunId) => summarize(source, prompt, false, diagnosticRunId),
 	})
 	const {
 		devices,
@@ -157,16 +157,12 @@ export function viewModel() {
 			const filtered = entries.filter((e) => isModelFile(e.name))
 			if (filtered.length === 0) {
 				preference.setModelPath(null)
-				// Download new model if no models and it's not manual installation
 				if (!preference.skippedSetup) {
 					navigate('/setup')
 				}
-			} else {
-				if (!preference.modelPath || !(await fs.exists(preference.modelPath))) {
-					// if model path not found set another one as default
-					const absPath = await path.join(configPath, filtered[0].name)
-					preference.setModelPath(absPath)
-				}
+			} else if (!preference.modelPath || !(await fs.exists(preference.modelPath))) {
+				const absPath = await path.join(configPath, filtered[0].name)
+				preference.setModelPath(absPath)
 			}
 		} catch (e) {
 			console.error(e)
@@ -214,7 +210,7 @@ export function viewModel() {
 		setRecordingName,
 		startRecord,
 		stopRecord,
-		preference: preference,
+		preference,
 		openPath,
 		selectFiles,
 		selectFolder,
