@@ -6,9 +6,11 @@ on:
     #     - main
     pull_request:
         paths:
-            - '.github/workflows/lint.yml'
+            - '.github/workflows/lint_rust.yml'
             - 'desktop/src-tauri/**'
             - 'cli/src/**'
+            - 'scripts/chunking_benchmark.py'
+            - 'scripts/test_chunking_benchmark.py'
     workflow_dispatch:
 
 env:
@@ -76,5 +78,7 @@ jobs:
             - name: run chunking tests
               run: cargo test --manifest-path Cargo.toml chunking
 
-            - name: validate benchmark script
-              run: python -m py_compile scripts/chunking_benchmark.py
+            - name: validate benchmark scripts
+              run: |
+                  python -m py_compile scripts/chunking_benchmark.py scripts/test_chunking_benchmark.py
+                  python scripts/test_chunking_benchmark.py
