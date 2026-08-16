@@ -1,15 +1,19 @@
 use crate::diagnostics::DiagnosticsState;
+use crate::error::LogError;
 use crate::ffmpeg::get_vibe_temp_folder;
 use eyre::{bail, Context, ContextCompat, Result};
 use serde_json::{json, Value};
 use std::{
     io::{BufRead, BufReader},
     path::PathBuf,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
+    time::Duration,
 };
 use tauri::{AppHandle, Emitter, Listener, Manager};
 
-use crate::error::LogError;
 use super::files::get_ffmpeg_path;
 
 #[cfg(windows)]
@@ -18,6 +22,7 @@ use std::process::Stdio;
 
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
+const STDERR_DIAGNOSTIC_BYTES: usize = 16 * 1024;
 
 fn get_binary_name() -> &'static str {
     if cfg!(windows) {
@@ -109,11 +114,10 @@ pub async fn download_audio(app_handle: AppHandle, url: String, out_path: String
     if let Some(id) = run_id.as_deref() {
         match &result {
             Ok(cancelled) => {
-                let outcome = if *cancelled { "aborted" } else { "succeeded" };
                 diagnostics
                     .finish_run(
                         id,
-                        outcome,
+                        if *cancelled { "aborted" } else { "succeeded" },
                         json!({
                             "cancelled": cancelled,
                             "output_path": out_path.clone(),
@@ -131,10 +135,7 @@ pub async fn download_audio(app_handle: AppHandle, url: String, out_path: String
         }
     }
 
-    match result {
-        Ok(_) => Ok(()),
-        Err(error) => Err(error),
-    }
+    result.map(|_| ())
 }
 
 async fn download_audio_inner(
@@ -202,61 +203,78 @@ async fn download_audio_inner(
     #[cfg(windows)]
     let cmd = cmd.creation_flags(CREATE_NO_WINDOW);
 
-    let cancel_flag = std::sync::Arc::new(AtomicBool::new(false));
+    let cancel_flag = Arc::new(AtomicBool::new(false));
     let cancel_flag_c = cancel_flag.clone();
     app_handle.once("ytdlp-cancel", move |_| {
         cancel_flag_c.store(true, Ordering::Relaxed);
     });
 
     let mut child = cmd.spawn().context("failed to spawn yt-dlp")?;
-    if let Some(stdout) = child.stdout.take() {
-        let reader = BufReader::new(stdout);
-        for line in reader.lines() {
-            if cancel_flag.load(Ordering::Relaxed) {
-                diag(
-                    diagnostics,
-                    run_id,
-                    "warning",
-                    "ytdlp.cancel_requested",
-                    "yt-dlp cancellation requested; terminating child process",
-                    json!({}),
-                );
-                let _ = child.kill();
-                break;
-            }
-
-            let line = line?.replace('\r', "").trim().to_string();
-            if line.starts_with("{\"progress") {
+    let stdout = child.stdout.take();
+    let app_for_stdout = app_handle.clone();
+    let stdout_thread = std::thread::spawn(move || {
+        if let Some(stdout) = stdout {
+            for line in BufReader::new(stdout).lines().map_while(|line| line.ok()) {
+                let line = line.replace('\r', "").trim().to_string();
+                if !line.starts_with("{\"progress") {
+                    continue;
+                }
                 if let Ok(value) = serde_json::from_str::<Value>(&line) {
-                    let percentage_str = value["progress_str"]
+                    let percentage = value["progress_str"]
                         .as_str()
                         .unwrap_or_default()
                         .trim()
-                        .replace('%', "");
-                    if let Ok(percentage_number) = percentage_str.parse::<f32>() {
-                        app_handle
-                            .emit("ytdlp-progress", percentage_number)
-                            .context("failed to emit")
-                            .log_error();
+                        .replace('%', "")
+                        .parse::<f32>();
+                    if let Ok(percentage) = percentage {
+                        app_for_stdout.emit("ytdlp-progress", percentage).log_error();
                     }
                 }
             }
         }
-    }
+    });
 
-    let status = child.wait()?;
-    let stderr_output = child
-        .stderr
-        .take()
-        .map(|stderr| {
-            BufReader::new(stderr)
-                .lines()
-                .map_while(Result::ok)
-                .collect::<Vec<_>>()
-                .join("\n")
-        })
+    let recent_stderr = Arc::new(Mutex::new(String::new()));
+    let stderr_capture = recent_stderr.clone();
+    let stderr = child.stderr.take();
+    let stderr_thread = std::thread::spawn(move || {
+        if let Some(stderr) = stderr {
+            for line in BufReader::new(stderr).lines().map_while(|line| line.ok()) {
+                if let Ok(mut buffer) = stderr_capture.lock() {
+                    buffer.push_str(&line);
+                    buffer.push('\n');
+                    trim_recent_utf8(&mut buffer, STDERR_DIAGNOSTIC_BYTES);
+                }
+            }
+        }
+    });
+
+    let mut cancellation_logged = false;
+    let status = loop {
+        if cancel_flag.load(Ordering::Relaxed) && !cancellation_logged {
+            cancellation_logged = true;
+            diag(
+                diagnostics,
+                run_id,
+                "warning",
+                "ytdlp.cancel_requested",
+                "yt-dlp cancellation requested; terminating child process",
+                json!({}),
+            );
+            let _ = child.kill();
+        }
+        if let Some(status) = child.try_wait().context("failed to poll yt-dlp process")? {
+            break status;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+
+    let _ = stdout_thread.join();
+    let _ = stderr_thread.join();
+    let stderr_excerpt = recent_stderr
+        .lock()
+        .map(|buffer| buffer.trim().to_string())
         .unwrap_or_default();
-    let stderr_excerpt: String = stderr_output.chars().rev().take(16_384).collect::<String>().chars().rev().collect();
     let cancelled = cancel_flag.load(Ordering::Relaxed);
 
     diag(
@@ -269,12 +287,12 @@ async fn download_audio_inner(
             "success": status.success(),
             "exit_code": status.code(),
             "cancelled": cancelled,
-            "stderr": stderr_excerpt,
+            "recent_stderr": stderr_excerpt.clone(),
         }),
     );
 
     if !status.success() && !cancelled {
-        bail!("Failed to download audio: {}", stderr_output);
+        bail!("Failed to download audio: {}", stderr_excerpt);
     }
     Ok(cancelled)
 }
@@ -294,6 +312,17 @@ fn diag(
     }
 }
 
+fn trim_recent_utf8(buffer: &mut String, max_bytes: usize) {
+    if buffer.len() <= max_bytes {
+        return;
+    }
+    let mut start = buffer.len().saturating_sub(max_bytes);
+    while start < buffer.len() && !buffer.is_char_boundary(start) {
+        start += 1;
+    }
+    buffer.drain(..start);
+}
+
 fn safe_url_summary(value: &str) -> String {
     match url::Url::parse(value) {
         Ok(mut parsed) => {
@@ -309,7 +338,7 @@ fn safe_url_summary(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::safe_url_summary;
+    use super::{safe_url_summary, trim_recent_utf8};
 
     #[test]
     fn diagnostic_url_summary_drops_sensitive_url_parts() {
@@ -318,5 +347,13 @@ mod tests {
         assert!(!sanitized.contains("secret"));
         assert!(!sanitized.contains("pass"));
         assert!(!sanitized.contains("token"));
+    }
+
+    #[test]
+    fn recent_stderr_trim_preserves_utf8() {
+        let mut value = format!("{}{}", "x".repeat(100), "á".repeat(20));
+        trim_recent_utf8(&mut value, 31);
+        assert!(value.len() <= 31);
+        assert!(std::str::from_utf8(value.as_bytes()).is_ok());
     }
 }
