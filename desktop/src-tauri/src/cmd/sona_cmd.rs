@@ -147,19 +147,22 @@ pub async fn load_model(
     };
 
     // Keep the engine decision in the backend so Home, Batch and other desktop
-    // callers cannot accidentally diverge. Metadata failure leaves the engine
-    // unknown; the transcription layer treats unknown/custom models
-    // conservatively as Whisper-compatible.
-    state_guard.model_engine = match state_guard.process.as_ref().unwrap().model_metadata(&model_path).await {
-        Ok(metadata) => {
-            tracing::debug!(engine = %metadata.capabilities.engine, "loaded model engine");
-            Some(metadata.capabilities.engine)
-        }
-        Err(error) => {
-            tracing::warn!("unable to resolve loaded model engine: {error:?}");
-            None
+    // callers cannot accidentally diverge. Resolve first, assign second, so the
+    // immutable borrow of the process is finished before mutating SonaState.
+    let resolved_engine = {
+        let sona = state_guard.process.as_ref().unwrap();
+        match sona.model_metadata(&model_path).await {
+            Ok(metadata) => {
+                tracing::debug!(engine = %metadata.capabilities.engine, "loaded model engine");
+                Some(metadata.capabilities.engine)
+            }
+            Err(error) => {
+                tracing::warn!("unable to resolve loaded model engine: {error:?}");
+                None
+            }
         }
     };
+    state_guard.model_engine = resolved_engine;
 
     if gpu_fallback {
         Ok("gpu_fallback".to_string())
