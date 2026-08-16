@@ -1,6 +1,7 @@
+use crate::diagnostics::DiagnosticsState;
 use crate::ffmpeg::get_vibe_temp_folder;
 use eyre::{bail, Context, ContextCompat, Result};
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::{
     io::{BufRead, BufReader},
     path::PathBuf,
@@ -9,7 +10,6 @@ use std::{
 use tauri::{AppHandle, Emitter, Listener, Manager};
 
 use crate::error::LogError;
-
 use super::files::get_ffmpeg_path;
 
 #[cfg(windows)]
@@ -46,11 +46,10 @@ pub async fn get_latest_ytdlp_version() -> Result<String> {
         .await?
         .error_for_status()?;
     let json: Value = resp.json().await?;
-    let tag = json["tag_name"]
+    json["tag_name"]
         .as_str()
-        .context("missing tag_name in latest release response")?
-        .to_string();
-    Ok(tag)
+        .context("missing tag_name in latest release response")
+        .map(ToString::to_string)
 }
 
 #[tauri::command]
@@ -77,25 +76,112 @@ pub fn get_temp_path(app_handle: AppHandle, ext: String, in_documents: Option<bo
 
 #[tauri::command]
 pub async fn download_audio(app_handle: AppHandle, url: String, out_path: String) -> Result<()> {
-    tracing::debug!("download audio {}", url);
-    let name = get_binary_name();
-    let path = app_handle.path().app_local_data_dir().context("Can't get data directory")?;
-    let path = path.join(name);
-    tracing::debug!("path is {}", path.display());
+    tracing::debug!("download audio from {}", safe_url_summary(&url));
+    let diagnostics = app_handle.state::<DiagnosticsState>();
+    let binary_name = get_binary_name();
+    let binary_dir = app_handle.path().app_local_data_dir().context("Can't get data directory")?;
+    let binary_path = binary_dir.join(binary_name);
     let ffmpeg_path = get_ffmpeg_path();
+    let run_id = diagnostics
+        .start_run(
+            "ytdlp_download",
+            json!({
+                "url": safe_url_summary(&url),
+                "output_path": out_path.clone(),
+                "binary": binary_path.clone(),
+                "binary_exists": binary_path.exists(),
+                "ffmpeg_path": ffmpeg_path.clone(),
+            }),
+        )
+        .ok();
 
-    // Set permission
+    let result = download_audio_inner(
+        &app_handle,
+        &url,
+        &out_path,
+        binary_path,
+        &ffmpeg_path,
+        &diagnostics,
+        run_id.as_deref(),
+    )
+    .await;
+
+    if let Some(id) = run_id.as_deref() {
+        match &result {
+            Ok(cancelled) => {
+                let outcome = if *cancelled { "aborted" } else { "succeeded" };
+                diagnostics
+                    .finish_run(
+                        id,
+                        outcome,
+                        json!({
+                            "cancelled": cancelled,
+                            "output_path": out_path.clone(),
+                            "output_exists": std::path::Path::new(&out_path).exists(),
+                            "output_size_bytes": std::fs::metadata(&out_path).ok().map(|metadata| metadata.len()),
+                        }),
+                    )
+                    .log_error();
+            }
+            Err(error) => {
+                diagnostics
+                    .finish_run(id, "failed", json!({ "error": format!("{error:#}") }))
+                    .log_error();
+            }
+        }
+    }
+
+    match result {
+        Ok(_) => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+async fn download_audio_inner(
+    app_handle: &AppHandle,
+    url: &str,
+    out_path: &str,
+    binary_path: PathBuf,
+    ffmpeg_path: &str,
+    diagnostics: &DiagnosticsState,
+    run_id: Option<&str>,
+) -> Result<bool> {
+    if !binary_path.exists() {
+        diag(
+            diagnostics,
+            run_id,
+            "error",
+            "ytdlp.binary_missing",
+            "yt-dlp binary is missing",
+            json!({ "binary": binary_path.clone() }),
+        );
+        bail!("yt-dlp binary not found at {}", binary_path.display());
+    }
+
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let meta = std::fs::metadata(path.clone())?;
+        let meta = std::fs::metadata(binary_path.clone())?;
         let mut perm = meta.permissions();
-        // chmod +x
         perm.set_mode(0o755);
-        std::fs::set_permissions(path.clone(), perm)?;
+        std::fs::set_permissions(binary_path.clone(), perm)?;
     }
 
-    let mut cmd = std::process::Command::new(path);
+    diag(
+        diagnostics,
+        run_id,
+        "info",
+        "ytdlp.process_start",
+        "Starting yt-dlp audio extraction",
+        json!({
+            "binary": binary_path.clone(),
+            "ffmpeg_path": ffmpeg_path,
+            "audio_format": "m4a",
+            "playlist": false,
+        }),
+    );
+
+    let mut cmd = std::process::Command::new(binary_path);
     let cmd = cmd
         .args([
             "--progress-template",
@@ -105,10 +191,10 @@ pub async fn download_audio(app_handle: AppHandle, url: String, out_path: String
             "--audio-format",
             "m4a",
             "--ffmpeg-location",
-            &ffmpeg_path,
-            &url,
+            ffmpeg_path,
+            url,
             "-o",
-            &out_path,
+            out_path,
         ])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -122,26 +208,31 @@ pub async fn download_audio(app_handle: AppHandle, url: String, out_path: String
         cancel_flag_c.store(true, Ordering::Relaxed);
     });
 
-    let mut child = cmd.spawn()?;
-
+    let mut child = cmd.spawn().context("failed to spawn yt-dlp")?;
     if let Some(stdout) = child.stdout.take() {
         let reader = BufReader::new(stdout);
-
         for line in reader.lines() {
             if cancel_flag.load(Ordering::Relaxed) {
+                diag(
+                    diagnostics,
+                    run_id,
+                    "warning",
+                    "ytdlp.cancel_requested",
+                    "yt-dlp cancellation requested; terminating child process",
+                    json!({}),
+                );
                 let _ = child.kill();
                 break;
             }
 
-            let mut line = line?;
-            line = line.replace("\r", "").trim().to_string();
-
+            let line = line?.replace('\r', "").trim().to_string();
             if line.starts_with("{\"progress") {
-                // try parse progress
-                let result: Result<Value, _> = serde_json::from_str(&line);
-                if let Ok(value) = result {
-                    // remove % and parse to number
-                    let percentage_str = value["progress_str"].as_str().unwrap_or_default().trim().replace("%", "");
+                if let Ok(value) = serde_json::from_str::<Value>(&line) {
+                    let percentage_str = value["progress_str"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .trim()
+                        .replace('%', "");
                     if let Ok(percentage_number) = percentage_str.parse::<f32>() {
                         app_handle
                             .emit("ytdlp-progress", percentage_number)
@@ -153,18 +244,79 @@ pub async fn download_audio(app_handle: AppHandle, url: String, out_path: String
         }
     }
 
-    let ret = child.wait()?;
-    if !ret.success() && !cancel_flag.load(Ordering::Relaxed) {
-        let mut stderr_output: String = "".to_string();
-        if let Some(stderr) = child.stderr.take() {
-            stderr_output = BufReader::new(stderr)
+    let status = child.wait()?;
+    let stderr_output = child
+        .stderr
+        .take()
+        .map(|stderr| {
+            BufReader::new(stderr)
                 .lines()
                 .map_while(Result::ok)
                 .collect::<Vec<_>>()
-                .join("\n");
-            eprintln!("Error: {}", stderr_output);
-        }
+                .join("\n")
+        })
+        .unwrap_or_default();
+    let stderr_excerpt: String = stderr_output.chars().rev().take(16_384).collect::<String>().chars().rev().collect();
+    let cancelled = cancel_flag.load(Ordering::Relaxed);
+
+    diag(
+        diagnostics,
+        run_id,
+        if status.success() { "info" } else if cancelled { "warning" } else { "error" },
+        "ytdlp.process_exit",
+        "yt-dlp child process exited",
+        json!({
+            "success": status.success(),
+            "exit_code": status.code(),
+            "cancelled": cancelled,
+            "stderr": stderr_excerpt,
+        }),
+    );
+
+    if !status.success() && !cancelled {
         bail!("Failed to download audio: {}", stderr_output);
     }
-    Ok(())
+    Ok(cancelled)
+}
+
+fn diag(
+    diagnostics: &DiagnosticsState,
+    run_id: Option<&str>,
+    severity: &str,
+    stage: &str,
+    message: &str,
+    data: Value,
+) {
+    if let Some(id) = run_id {
+        diagnostics
+            .record_event(id, severity, "ytdlp", stage, message, data)
+            .log_error();
+    }
+}
+
+fn safe_url_summary(value: &str) -> String {
+    match url::Url::parse(value) {
+        Ok(mut parsed) => {
+            parsed.set_query(None);
+            parsed.set_fragment(None);
+            let _ = parsed.set_username("");
+            let _ = parsed.set_password(None);
+            parsed.to_string()
+        }
+        Err(_) => "<invalid-or-non-url>".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::safe_url_summary;
+
+    #[test]
+    fn diagnostic_url_summary_drops_sensitive_url_parts() {
+        let sanitized = safe_url_summary("https://user:pass@example.org/watch?v=abc&token=secret#x");
+        assert!(sanitized.contains("example.org/watch"));
+        assert!(!sanitized.contains("secret"));
+        assert!(!sanitized.contains("pass"));
+        assert!(!sanitized.contains("token"));
+    }
 }
