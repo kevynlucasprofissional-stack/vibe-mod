@@ -152,6 +152,7 @@ export function viewModel() {
 			return
 		}
 
+		isAbortingRef.current = false
 		const avx2 = await invoke<boolean>('is_avx2_enabled')
 		if (!avx2) {
 			trackAnalyticsEvent(analyticsEvents.AVX2_NOT_SUPPORTED)
@@ -275,6 +276,10 @@ export function viewModel() {
 				const errorCode = errorObj?.code
 				const errorMessage = errorObj?.message || String(error)
 
+				if (isAbortingRef.current || errorCode === 'aborted') {
+					break
+				}
+
 				// Check if this is a user error
 				if (errorCode && isUserError(errorCode)) {
 					// User error: show toast, skip analytics
@@ -287,11 +292,7 @@ export function viewModel() {
 						error_message: errorMessage,
 						file_ext: file.name.split('.').pop() ?? 'unknown',
 					})
-					if (isAbortingRef.current) {
-						navigate('/')
-					} else {
-						console.error(`error while transcribe ${file.name}: `, error)
-					}
+					console.error(`error while transcribe ${file.name}: `, error)
 
 					// Stop batch if model is not loaded — all subsequent files will fail too
 					if (String(error).includes('no model loaded')) {
@@ -304,12 +305,24 @@ export function viewModel() {
 				setCurrentIndex(localIndex)
 			}
 		}
+
+		const wasAborted = isAbortingRef.current
 		stopKeepAwake()
-		setCurrentIndex(files.length + 1)
+		if (!wasAborted) {
+			setCurrentIndex(files.length + 1)
+		}
 		setInProgress(false)
 		setIsAborting(false)
 		setProgress(null)
-		// Focus back the window and play sound
+		isAbortingRef.current = false
+
+		if (wasAborted) {
+			console.info(`Batch transcription aborted after ${localIndex} completed files.`)
+			navigate('/')
+			return
+		}
+
+		// Focus back the window and play sound only for a completed batch.
 		if (preference!.soundOnFinish) {
 			new Audio(successSound).play()
 		}
