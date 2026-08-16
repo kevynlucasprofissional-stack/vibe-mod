@@ -3,13 +3,12 @@ use crate::error::LogError;
 use crate::setup::SonaState;
 use eyre::{bail, Context, ContextCompat, Result};
 use serde_json::json;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use tauri::{Manager, State};
 use tokio::sync::Mutex;
 
 pub fn resolve_sona_binary(app_handle: &tauri::AppHandle) -> Result<PathBuf> {
     let resource_dir = app_handle.path().resource_dir().context("get resource dir")?;
-
     #[cfg(target_os = "windows")]
     let binary_name = "sona.exe";
     #[cfg(not(target_os = "windows"))]
@@ -69,7 +68,7 @@ pub async fn load_model(
         .start_run(
             "model_load",
             json!({
-                "model_path": model_path,
+                "model_path": model_path.clone(),
                 "gpu_device": gpu_device,
                 "unload_timeout_minutes": unload_timeout_minutes,
             }),
@@ -93,7 +92,16 @@ pub async fn load_model(
             .log_error();
     }
 
-    let result = load_model_inner(&app_handle, &model_path, gpu_device, unload_timeout_minutes, &diagnostics, run_id.as_deref()).await;
+    let result = load_model_inner(
+        &app_handle,
+        &model_path,
+        gpu_device,
+        unload_timeout_minutes,
+        &diagnostics,
+        run_id.as_deref(),
+    )
+    .await;
+
     if let Some(run_id) = run_id.as_deref() {
         match &result {
             Ok(value) => {
@@ -105,15 +113,16 @@ pub async fn load_model(
                         "succeeded",
                         json!({
                             "result": value,
-                            "engine": guard.model_engine,
+                            "engine": guard.model_engine.as_deref(),
                             "gpu_device": guard.gpu_device,
                             "gpu_fallback": guard.gpu_fallback,
-                            "model_path": guard.loaded_model_path,
+                            "model_path": guard.loaded_model_path.as_deref(),
                         }),
                     )
                     .log_error();
             }
             Err(error) => {
+                let error_text = format!("{error:#}");
                 diagnostics
                     .record_event(
                         run_id,
@@ -121,11 +130,11 @@ pub async fn load_model(
                         "model",
                         "model.load_failed",
                         "Model loading failed",
-                        json!({ "error": format!("{error:#}") }),
+                        json!({ "error": error_text.clone() }),
                     )
                     .log_error();
                 diagnostics
-                    .finish_run(run_id, "failed", json!({ "error": format!("{error:#}") }))
+                    .finish_run(run_id, "failed", json!({ "error": error_text }))
                     .log_error();
             }
         }
@@ -275,6 +284,8 @@ async fn load_model_inner(
     state_guard.loaded_model_path = Some(model_path.to_string());
     state_guard.gpu_device = gpu_device;
     state_guard.gpu_fallback = gpu_fallback;
+    let engine = state_guard.model_engine.clone();
+    let sona_stderr = state_guard.process.as_ref().map(crate::sona::SonaProcess::recent_stderr);
     diag(
         diagnostics,
         run_id,
@@ -282,10 +293,10 @@ async fn load_model_inner(
         "model.load_completed",
         "Model load completed",
         json!({
-            "engine": state_guard.model_engine,
+            "engine": engine,
             "gpu_device": gpu_device,
             "gpu_fallback": gpu_fallback,
-            "sona_stderr": state_guard.process.as_ref().map(crate::sona::SonaProcess::recent_stderr),
+            "sona_stderr": sona_stderr,
         }),
     );
 
@@ -303,7 +314,14 @@ fn clear_model_state(state: &mut SonaState) {
     state.gpu_fallback = false;
 }
 
-fn diag(diagnostics: &DiagnosticsState, run_id: Option<&str>, severity: &str, stage: &str, message: &str, data: serde_json::Value) {
+fn diag(
+    diagnostics: &DiagnosticsState,
+    run_id: Option<&str>,
+    severity: &str,
+    stage: &str,
+    message: &str,
+    data: serde_json::Value,
+) {
     if let Some(run_id) = run_id {
         diagnostics
             .record_event(run_id, severity, "model", stage, message, data)
@@ -314,8 +332,7 @@ fn diag(diagnostics: &DiagnosticsState, run_id: Option<&str>, severity: &str, st
 #[tauri::command]
 pub async fn get_gpu_devices(app_handle: tauri::AppHandle) -> Result<Vec<crate::sona::GpuDevice>> {
     let binary_path = resolve_sona_binary(&app_handle)?;
-    let devices = crate::sona::list_gpu_devices(&binary_path)?;
-    Ok(devices)
+    crate::sona::list_gpu_devices(&binary_path)
 }
 
 #[tauri::command]
@@ -393,11 +410,5 @@ mod tests {
         assert!(state.loaded_model_path.is_none());
         assert!(state.gpu_device.is_none());
         assert!(!state.gpu_fallback);
-    }
-
-    #[test]
-    fn resolve_ffmpeg_path_type_remains_path_based() {
-        fn accepts_path(_: Option<&Path>) {}
-        accepts_path(None);
     }
 }
