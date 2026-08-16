@@ -3,7 +3,7 @@ use crate::ffmpeg::get_vibe_temp_folder;
 use crate::{cmd::app::get_logs_folder, config, logging::get_log_path};
 use eyre::{eyre, ContextCompat, Result};
 use std::path::Path;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tauri::Manager;
 
 const RAW_LOG_RETENTION_DAYS: u64 = 14;
@@ -73,7 +73,7 @@ fn is_older_than(path: &Path, days: u64) -> bool {
     };
     let cutoff = SystemTime::now()
         .checked_sub(Duration::from_secs(days.saturating_mul(24 * 60 * 60)))
-        .unwrap_or(SystemTime::UNIX_EPOCH);
+        .unwrap_or(UNIX_EPOCH);
     modified < cutoff
 }
 
