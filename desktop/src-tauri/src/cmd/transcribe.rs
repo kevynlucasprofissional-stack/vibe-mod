@@ -14,8 +14,8 @@ use tauri::{Emitter, Listener, State};
 use tokio::sync::Mutex;
 
 use super::chunking::{
-    detect_silences, extract_chunk, globalize_segments, merge_segments, plan_chunks,
-    probe_duration_seconds, ChunkWindow, CHUNKING_MIN_DURATION_SECONDS, DEFAULT_CHUNK_SECONDS,
+    extract_chunk, globalize_segments, merge_segments, plan_chunks, probe_duration_seconds,
+    CHUNKING_MIN_DURATION_SECONDS, DEFAULT_CHUNK_SECONDS,
 };
 use super::{ui::set_progress_bar, CommandError};
 
@@ -60,8 +60,8 @@ pub struct TranscribeOptions {
 enum ProgressMode {
     Direct,
     Chunked {
-        owner_start: f64,
-        owner_duration: f64,
+        chunk_start: f64,
+        chunk_duration: f64,
         media_duration: f64,
     },
 }
@@ -226,22 +226,9 @@ async fn transcribe_chunked(
         return Ok(Vec::new());
     }
 
-    let silences = match detect_silences(audio_path, media_duration) {
-        Ok(silences) => silences,
-        Err(error) => {
-            tracing::warn!(
-                "silence-aware cut detection failed, using fixed boundaries under the 30-second request ceiling: {error:?}"
-            );
-            Vec::new()
-        }
-    };
-    if abort_atomic.load(Ordering::Relaxed) {
-        return Ok(Vec::new());
-    }
-
-    let windows = plan_chunks(media_duration, &silences);
+    let windows = plan_chunks(media_duration);
     tracing::info!(
-        "chunked transcription enabled: duration={:.2}s chunks={} request_ceiling={}s",
+        "fixed-window transcription enabled: duration={:.2}s chunks={} request_ceiling={}s",
         media_duration,
         windows.len(),
         DEFAULT_CHUNK_SECONDS
@@ -268,8 +255,8 @@ async fn transcribe_chunked(
             &chunk_options,
             abort_atomic,
             ProgressMode::Chunked {
-                owner_start: window.owner_start,
-                owner_duration: window.owner_duration(),
+                chunk_start: window.start,
+                chunk_duration: window.duration(),
                 media_duration,
             },
             Some(&reported_progress),
@@ -386,10 +373,10 @@ fn update_progress(
     let mapped = match mode {
         ProgressMode::Direct => progress,
         ProgressMode::Chunked {
-            owner_start,
-            owner_duration,
+            chunk_start,
+            chunk_duration,
             media_duration,
-        } => ((owner_start + owner_duration * (progress / 100.0)) / media_duration * 100.0)
+        } => ((chunk_start + chunk_duration * (progress / 100.0)) / media_duration * 100.0)
             .clamp(0.0, 99.9),
     };
 
