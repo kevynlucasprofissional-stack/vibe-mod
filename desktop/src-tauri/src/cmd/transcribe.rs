@@ -190,7 +190,7 @@ async fn transcribe_inner(
         }
     };
 
-    if media_duration < CHUNKING_MIN_DURATION_SECONDS {
+    if media_duration <= CHUNKING_MIN_DURATION_SECONDS {
         return transcribe_stream_collect(
             app_handle,
             client,
