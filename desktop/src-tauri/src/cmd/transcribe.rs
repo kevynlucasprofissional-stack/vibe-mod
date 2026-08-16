@@ -224,16 +224,26 @@ async fn transcribe_chunked(
     abort_atomic: &AtomicBool,
     media_duration: f64,
 ) -> Result<Vec<Segment>, CommandError> {
+    if abort_atomic.load(Ordering::Relaxed) {
+        return Ok(Vec::new());
+    }
+
     let silences = match detect_silences(audio_path, media_duration) {
         Ok(silences) => silences,
         Err(error) => {
-            tracing::warn!("silence-aware cut detection failed, using exact 30-second boundaries: {error:?}");
+            tracing::warn!(
+                "silence-aware cut detection failed, using fixed boundaries under the 30-second request ceiling: {error:?}"
+            );
             Vec::new()
         }
     };
+    if abort_atomic.load(Ordering::Relaxed) {
+        return Ok(Vec::new());
+    }
+
     let initial_windows = plan_chunks(media_duration, &silences);
     tracing::info!(
-        "chunked transcription enabled: duration={:.2}s chunks={} target={}s",
+        "chunked transcription enabled: duration={:.2}s chunks={} request_ceiling={}s",
         media_duration,
         initial_windows.len(),
         DEFAULT_CHUNK_SECONDS
@@ -241,6 +251,7 @@ async fn transcribe_chunked(
 
     let mut queue: VecDeque<ChunkWindow> = initial_windows.into_iter().collect();
     let mut accepted_segments = Vec::new();
+    // Store thousandths of a percent so retries cannot make fractional progress move backwards.
     let reported_progress = AtomicI64::new(0);
 
     while let Some(window) = queue.pop_front() {
@@ -282,12 +293,12 @@ async fn transcribe_chunked(
         if is_repetition_suspicious(&local_segments) {
             if let Some((left, right)) = split_window(window, media_duration) {
                 tracing::warn!(
-                    "repetition loop detected in {:.2}-{:.2}s (score {:.3}); retrying as {:.2}s + {:.2}s",
+                    "repetition loop detected in {:.2}-{:.2}s (score {:.3}); retrying as {:.2}s + {:.2}s model requests",
                     window.owner_start,
                     window.owner_end,
                     score,
-                    left.owner_duration(),
-                    right.owner_duration()
+                    left.extract_duration(),
+                    right.extract_duration()
                 );
                 queue.push_front(right);
                 queue.push_front(left);
@@ -408,11 +419,11 @@ fn update_progress(
             owner_duration,
             media_duration,
         } => ((owner_start + owner_duration * (progress / 100.0)) / media_duration * 100.0)
-            .clamp(0.0, 100.0),
+            .clamp(0.0, 99.9),
     };
 
     if let Some(reported) = reported_progress {
-        let candidate = mapped.round() as i64;
+        let candidate = (mapped * 1000.0).round() as i64;
         let previous = reported.fetch_max(candidate, Ordering::Relaxed);
         if candidate < previous {
             return;
