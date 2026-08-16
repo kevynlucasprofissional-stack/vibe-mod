@@ -191,22 +191,22 @@ pub fn extract_chunk(input: &Path, window: ChunkWindow) -> Result<PathBuf> {
     Ok(output_path)
 }
 
+/// Convert chunk-local timestamps back to the source-media timeline.
+///
+/// This intentionally preserves every segment produced in the overlap. Boundary
+/// reconciliation happens later in `merge_segments`. Dropping a segment here by
+/// an ownership/midpoint rule can erase a phrase when neighboring requests split
+/// the same acoustic event differently.
 pub fn globalize_segments(segments: Vec<Segment>, window: ChunkWindow, media_duration: f64) -> Vec<Segment> {
     let offset = (window.extract_start * 100.0).round() as i64;
-    let owner_start = (window.owner_start * 100.0).round() as i64;
-    let owner_end = (window.owner_end * 100.0).round() as i64;
     let media_end = (media_duration * 100.0).round() as i64;
 
     segments
         .into_iter()
-        .filter_map(|mut segment| {
+        .map(|mut segment| {
             segment.start = (segment.start + offset).clamp(0, media_end);
             segment.stop = (segment.stop + offset).clamp(segment.start, media_end);
-            let midpoint = segment.start + (segment.stop - segment.start) / 2;
-            if midpoint < owner_start || midpoint >= owner_end {
-                return None;
-            }
-            Some(segment)
+            segment
         })
         .collect()
 }
@@ -271,21 +271,39 @@ pub fn sanitize_pathological_repetitions(segments: Vec<Segment>) -> Vec<Segment>
     cleaned
 }
 
+/// Merge only boundary duplicates for which there is strong evidence that both
+/// requests describe the same acoustic event: equal normalized text, equal
+/// speaker identity, and a real positive temporal overlap.
+///
+/// Ambiguous variants are deliberately preserved. A duplicate is preferable to
+/// deleting real speech when the two chunk decodes disagree.
 pub fn merge_segments(mut segments: Vec<Segment>) -> Vec<Segment> {
     segments.sort_by_key(|segment| (segment.start, segment.stop));
     let mut merged: Vec<Segment> = Vec::with_capacity(segments.len());
+
     for segment in segments {
-        let duplicate = merged.last().is_some_and(|previous| {
-            let previous_text = normalize_text(&previous.text);
-            let current_text = normalize_text(&segment.text);
-            let enough_content = previous_text.len().min(current_text.len()) >= 8;
-            let close_in_time = segment.start <= previous.stop.saturating_add(150);
-            enough_content && close_in_time && text_similarity(&previous_text, &current_text) >= 0.90
-        });
-        if !duplicate {
+        let normalized = normalize_text(&segment.text);
+        let duplicate_index = if normalized.is_empty() {
+            None
+        } else {
+            merged.iter().rposition(|previous| {
+                let overlaps = segment.start < previous.stop && previous.start < segment.stop;
+                overlaps
+                    && previous.speaker == segment.speaker
+                    && normalize_text(&previous.text) == normalized
+            })
+        };
+
+        if let Some(index) = duplicate_index {
+            let previous = &mut merged[index];
+            previous.start = previous.start.min(segment.start);
+            previous.stop = previous.stop.max(segment.stop);
+        } else {
             merged.push(segment);
         }
     }
+
+    merged.sort_by_key(|segment| (segment.start, segment.stop));
     merged
 }
 
@@ -425,7 +443,7 @@ mod tests {
     }
 
     #[test]
-    fn globalizes_and_keeps_only_owned_segments() {
+    fn globalizes_overlap_segments_without_dropping_them() {
         let window = ChunkWindow {
             owner_start: 28.0,
             owner_end: 56.0,
@@ -439,9 +457,52 @@ mod tests {
             segment(2900, 3000, "right overlap"),
         ];
         let global = globalize_segments(local, window, 90.0);
-        assert_eq!(global.len(), 1);
-        assert_eq!(global[0].start, 2900);
-        assert_eq!(global[0].stop, 3000);
+        assert_eq!(global.len(), 3);
+        assert_eq!((global[0].start, global[0].stop), (2700, 2750));
+        assert_eq!((global[1].start, global[1].stop), (2900, 3000));
+        assert_eq!((global[2].start, global[2].stop), (5600, 5700));
+    }
+
+    #[test]
+    fn merge_preserves_boundary_phrase_that_midpoint_ownership_could_drop() {
+        let left_window = ChunkWindow {
+            owner_start: 0.0,
+            owner_end: 28.0,
+            extract_start: 0.0,
+            extract_end: 29.0,
+            depth: 0,
+        };
+        let right_window = ChunkWindow {
+            owner_start: 28.0,
+            owner_end: 56.0,
+            extract_start: 27.0,
+            extract_end: 57.0,
+            depth: 0,
+        };
+
+        let mut global = globalize_segments(
+            vec![segment(2700, 2950, "frase que cruza a fronteira")],
+            left_window,
+            90.0,
+        );
+        global.extend(globalize_segments(
+            vec![segment(0, 150, "frase que cruza a fronteira")],
+            right_window,
+            90.0,
+        ));
+
+        let merged = merge_segments(global);
+        assert_eq!(merged.len(), 1);
+        assert_eq!((merged[0].start, merged[0].stop), (2700, 2950));
+    }
+
+    #[test]
+    fn merge_preserves_ambiguous_boundary_variants() {
+        let merged = merge_segments(vec![
+            segment(2700, 2950, "vamos começar agora"),
+            segment(2700, 2850, "começar agora"),
+        ]);
+        assert_eq!(merged.len(), 2);
     }
 
     #[test]
@@ -467,20 +528,27 @@ mod tests {
     }
 
     #[test]
-    fn merge_removes_long_boundary_duplicates() {
+    fn merge_removes_exact_overlapping_boundary_duplicates() {
         let merged = merge_segments(vec![
             segment(2700, 2900, "we need to finish this sentence"),
             segment(2800, 3000, "we need to finish this sentence"),
             segment(3000, 3200, "and then continue"),
         ]);
         assert_eq!(merged.len(), 2);
+        assert_eq!((merged[0].start, merged[0].stop), (2700, 3000));
     }
 
     #[test]
     fn merge_keeps_legitimate_short_repetition() {
+        let merged = merge_segments(vec![segment(100, 150, "sim"), segment(150, 200, "sim")]);
+        assert_eq!(merged.len(), 2);
+    }
+
+    #[test]
+    fn merge_keeps_same_phrase_when_intervals_do_not_overlap() {
         let merged = merge_segments(vec![
-            segment(100, 150, "sim"),
-            segment(150, 200, "sim"),
+            segment(100, 150, "muito obrigado a todos"),
+            segment(150, 200, "muito obrigado a todos"),
         ]);
         assert_eq!(merged.len(), 2);
     }
