@@ -6,9 +6,9 @@ Vibe can protect long transcriptions from decoder loops by splitting the media i
 
 - Protection is enabled by default through `modelOptions.chunking_enabled`.
 - Files shorter than 35 seconds keep the original single-request path.
-- Principal chunk ownership is never longer than 30 seconds.
-- The planner looks for a silence in the last 2 seconds before a 30-second boundary and may cut a little earlier.
-- Each extraction contains 1 second of overlap on either side when media is available.
+- **Thirty seconds is a hard ceiling for the audio sent to the model**, including contextual overlap.
+- Normal ownership windows target 28 seconds. With up to 1 second of context on each side, interior Sona requests are at most 30 seconds.
+- The planner looks for a silence in the last 2 seconds before an ownership boundary and may cut a little earlier.
 - Overlap is context only. An ownership window decides which segments are accepted.
 - The Sona model remains loaded. Only transcription context is reset by issuing a new `/v1/audio/transcriptions` request for each chunk.
 - The previous chunk transcript is never injected as a prompt. A user-supplied `init_prompt` is still preserved.
@@ -17,22 +17,22 @@ Vibe can protect long transcriptions from decoder loops by splitting the media i
 
 1. Probe media duration.
 2. Bypass chunking for short files or speaker diarization.
-3. Detect silence positions with FFmpeg. If this analysis fails, fall back to exact 30-second boundaries.
-4. Build ownership windows of at most 30 seconds and extraction windows with overlap.
+3. Detect silence positions with FFmpeg. If this analysis fails, fall back to fixed boundaries that still respect the 30-second request ceiling.
+4. Build ownership windows and extraction windows so every model request, overlap included, is at most 30 seconds.
 5. Extract one temporary 16 kHz mono PCM WAV at a time.
 6. Transcribe sequentially using the already-loaded Sona model.
 7. Score the chunk for pathological repetition.
 8. When repetition is detected, discard that result and retry the same ownership range as two smaller chunks.
-9. Retry at 30s -> 15s -> 7.5s. At the retry floor, collapse consecutive pathological duplicates instead of allowing an infinite retry loop.
+9. Adaptive requests shrink from at most 30s to at most 15s and then at most 7.5s. At the retry floor, collapse consecutive pathological duplicates instead of allowing an infinite retry loop.
 10. Convert local chunk timestamps back to the original media timeline.
-11. Keep only segments owned by the current window, merge all accepted segments, and remove near-duplicate boundary segments.
+11. Keep only segments owned by the current window, merge all accepted segments, and remove sufficiently long near-duplicate boundary segments while preserving legitimate short repetitions such as “yes / yes”.
 12. Return one normal Vibe `Transcript`, so TXT/SRT/VTT/JSON/CSV/DOCX exporters continue to work without chunk awareness.
 
 ## Progress and cancellation
 
-Sona reports progress per request. Vibe maps each request back to the corresponding position in the original file, so the UI sees one global 0-100% operation rather than repeated 0-100% cycles. Progress is clamped so adaptive retries do not move the UI backwards.
+Sona reports progress per request. Vibe maps each request back to the corresponding position in the original file, so the UI sees one global 0-100% operation rather than repeated 0-100% cycles. Progress is stored at thousandths-of-a-percent precision and clamped so adaptive retries do not move the UI backwards. Chunked progress cannot report 100% before validation and merging complete; the final 100% is emitted only after the accepted chunk queue finishes.
 
-Only one `abort_transcribe` listener is registered for an operation, and it is explicitly removed when the command finishes. Cancellation prevents subsequent chunks from being scheduled and temporary chunks are removed after each attempt.
+Only one `abort_transcribe` listener is registered for an operation, and it is explicitly removed when the command finishes. Cancellation prevents subsequent chunks from being scheduled and temporary chunks are removed after each attempt. The implementation also checks cancellation around the initial media-analysis stage.
 
 ## Speaker diarization
 
@@ -59,14 +59,15 @@ Development follows a gated loop for each change:
 The Rust unit tests cover:
 
 - FFmpeg duration parsing;
-- maximum 30-second ownership;
+- hard 30-second model-request ceiling including overlap;
 - silence-aware cuts;
 - overlap semantics;
 - global timestamp reconstruction;
 - loop detection;
 - healthy-text false-positive protection;
 - boundary deduplication;
-- adaptive 30 -> 15 -> 7.5 second retries.
+- preservation of legitimate short repetition;
+- adaptive <=30 -> <=15 -> <=7.5 second retries.
 
 Use the benchmark script to compare a known problematic file with protection disabled and enabled:
 
@@ -90,13 +91,13 @@ The comparison reports adjacent duplicates, dominant repeated segments, repeated
 
 ## Real-file acceptance matrix
 
-Before declaring the feature production-ready, validate at least:
+Before declaring the feature empirically production-ready, validate at least:
 
 - 20-30 second audio: unchanged original path;
 - 1-5 minute speech: chunked path and continuous timestamps;
 - 30-60 minute speech: no repeated-loop tail;
 - multi-hour audio/video: stable memory and temporary-file cleanup;
-- speech crossing an exact 30-second boundary;
+- speech crossing a chunk boundary;
 - long silence around a boundary;
 - music/noise around a boundary;
 - stable timestamps enabled;
