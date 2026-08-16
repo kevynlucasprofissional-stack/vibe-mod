@@ -8,9 +8,7 @@ export async function getPrettyVersion() {
 	const appName = await app.getName()
 	let version = `${appName} ${appVersion}`
 	const avx2Enabled = await invoke('is_avx2_enabled')
-	if (!avx2Enabled) {
-		version += ` (older cpu)`
-	}
+	if (!avx2Enabled) version += ` (older cpu)`
 	return version
 }
 
@@ -26,11 +24,11 @@ export async function getAppInfo() {
 	const configPath = await invoke<string>('get_models_folder')
 	const entries = await ls(configPath)
 	const models = entries
-		.filter((e) => e.name?.endsWith('.bin'))
+		.filter((e) => e.name?.endsWith('.bin') || e.name?.endsWith('.gguf'))
 		.map((e) => e.name)
 		.join(', ')
-	const defaultModel = localStorage.getItem('prefs_model_path')?.split('/')?.pop() ?? 'Not Found'
-	const cargoFeatures = (await invoke<string[]>('get_cargo_features')) || 'n/a'
+	const defaultModel = localStorage.getItem('prefs_model_path')?.split(/[\\/]/)?.pop() ?? 'Not Found'
+	const cargoFeatures = (await invoke<string[]>('get_cargo_features')) || []
 	return [
 		`App Version: ${appVersion}`,
 		`Commit Hash: ${commitHash}`,
@@ -49,32 +47,28 @@ export async function getAppInfo() {
 export async function collectLogs() {
 	try {
 		let info = await getAppInfo()
-		const logs: string = await invoke<string>('get_logs')
-		const filteredLogs = logs
-			.split('\n')
-			.filter((l) => l.toLowerCase().includes('error')) // Filter lines with "debug"
-			.slice(-10) // Take the last 3 lines
-			.map((line) => {
-				try {
-					const parsed = JSON.parse(line) // Deserialize JSON
-					return parsed?.fields?.message || 'No message found' // Extract .message or fallback
-				} catch (e) {
-					return 'Invalid JSON' // Handle invalid JSON
-				}
-			})
-			.join('\n')
-		const templatedLogs = `<details>
-<summary>logs</summary>
+		const diagnostic = await invoke<string | null>('get_latest_diagnostic_report_content')
+		if (diagnostic) {
+			info += `\n\n<details>\n<summary>latest structured diagnostic report</summary>\n\n\`\`\`json\n${diagnostic}\n\`\`\`\n</details>\n`
+			return info
+		}
 
-\`\`\`console
-${filteredLogs}
-\`\`\`
-</details>
-`
-		info += `\n\n\n${templatedLogs}`
+		// Compatibility fallback for installations that have not generated a
+		// structured report yet. Include warnings as well as errors and keep more
+		// context than the old ten-error-line collector.
+		const logs = await invoke<string>('get_logs')
+		const relevantLogs = logs
+			.split('\n')
+			.filter((line) => {
+				const lower = line.toLowerCase()
+				return lower.includes('error') || lower.includes('warn')
+			})
+			.slice(-50)
+			.join('\n')
+		info += `\n\n<details>\n<summary>raw warning/error log fallback</summary>\n\n\`\`\`console\n${relevantLogs}\n\`\`\`\n</details>\n`
 		return info
-	} catch (e) {
-		console.error(e)
-		return `Couldn't collect logs ${e}`
+	} catch (error) {
+		console.error(error)
+		return `Couldn't collect diagnostic information: ${error}`
 	}
 }
