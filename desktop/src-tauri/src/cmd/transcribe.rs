@@ -75,13 +75,13 @@ pub async fn transcribe(
     let audio_path = PathBuf::from(&options.path);
     validate_audio_path(&audio_path, &options.path)?;
 
-    let (client, base_url) = {
+    let (client, base_url, model_engine) = {
         let state = sona_state.lock().await;
         let process = state.process.as_ref().ok_or_else(|| CommandError {
             code: "no_model".to_string(),
             message: "Please load model first".to_string(),
         })?;
-        (process.client(), process.base_url())
+        (process.client(), process.base_url(), state.model_engine.clone())
     };
 
     let abort_atomic = Arc::new(AtomicBool::new(false));
@@ -100,6 +100,7 @@ pub async fn transcribe(
         &audio_path,
         &options,
         &abort_atomic,
+        model_engine.as_deref(),
     )
     .await;
 
@@ -128,6 +129,14 @@ fn validate_audio_path(audio_path: &Path, original: &str) -> Result<(), CommandE
     Ok(())
 }
 
+fn engine_uses_external_chunking(engine: Option<&str>) -> bool {
+    engine.is_none_or(|engine| engine.eq_ignore_ascii_case("whisper"))
+}
+
+fn should_use_external_chunking(enabled: bool, engine: Option<&str>, diarization_enabled: bool) -> bool {
+    enabled && !diarization_enabled && engine_uses_external_chunking(engine)
+}
+
 async fn transcribe_inner(
     app_handle: &tauri::AppHandle,
     client: &reqwest::Client,
@@ -135,6 +144,7 @@ async fn transcribe_inner(
     audio_path: &Path,
     options: &TranscribeOptions,
     abort_atomic: &AtomicBool,
+    model_engine: Option<&str>,
 ) -> Result<Vec<Segment>, CommandError> {
     let chunking_enabled = options.chunking_enabled.unwrap_or(true);
     let diarization_enabled = options
@@ -144,21 +154,16 @@ async fn transcribe_inner(
 
     if chunking_enabled && diarization_enabled {
         tracing::warn!(
-            "30-second chunk protection is disabled for this run because cross-chunk speaker identity is not yet safe"
+            "Whisper long-file protection is disabled for this run because cross-chunk speaker identity is not safe"
         );
-        return transcribe_stream_collect(
-            app_handle,
-            client,
-            base_url,
-            options,
-            abort_atomic,
-            ProgressMode::Direct,
-            None,
-        )
-        .await;
+    } else if chunking_enabled && !engine_uses_external_chunking(model_engine) {
+        tracing::debug!(
+            engine = model_engine.unwrap_or("unknown"),
+            "external chunking bypassed because this engine uses Sona-native chunking"
+        );
     }
 
-    if !chunking_enabled {
+    if !should_use_external_chunking(chunking_enabled, model_engine, diarization_enabled) {
         return transcribe_stream_collect(
             app_handle,
             client,
@@ -174,7 +179,7 @@ async fn transcribe_inner(
     let media_duration = match probe_duration_seconds(audio_path) {
         Ok(duration) => duration,
         Err(error) => {
-            tracing::warn!("unable to probe duration for chunking, using normal transcription: {error:?}");
+            tracing::warn!("unable to probe duration for Whisper chunking, using normal transcription: {error:?}");
             return transcribe_stream_collect(
                 app_handle,
                 client,
@@ -228,7 +233,7 @@ async fn transcribe_chunked(
 
     let windows = plan_chunks(media_duration);
     tracing::info!(
-        "fixed-window transcription enabled: duration={:.2}s chunks={} request_ceiling={}s",
+        "Whisper fixed-window protection enabled: duration={:.2}s chunks={} request_ceiling={}s",
         media_duration,
         windows.len(),
         DEFAULT_CHUNK_SECONDS
@@ -399,5 +404,26 @@ fn map_sona_error(error: eyre::Report) -> CommandError {
         }
     } else {
         CommandError::from(error)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn external_chunking_targets_whisper_and_unknown_custom_models() {
+        assert!(engine_uses_external_chunking(Some("whisper")));
+        assert!(engine_uses_external_chunking(Some("WHISPER")));
+        assert!(engine_uses_external_chunking(None));
+        assert!(!engine_uses_external_chunking(Some("nemotron")));
+        assert!(!engine_uses_external_chunking(Some("parakeet")));
+    }
+
+    #[test]
+    fn diarization_always_bypasses_external_chunking() {
+        assert!(!should_use_external_chunking(true, Some("whisper"), true));
+        assert!(should_use_external_chunking(true, Some("whisper"), false));
+        assert!(!should_use_external_chunking(false, Some("whisper"), false));
     }
 }
