@@ -29,7 +29,6 @@ use error::LogError;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Attach console in Windows:
     #[cfg(all(windows, not(debug_assertions)))]
     cli::attach_console();
 
@@ -120,6 +119,14 @@ async fn main() -> Result<()> {
             cmd::app::type_text,
             cmd::permissions::request_system_audio_permission,
             cmd::permissions::open_system_audio_settings,
+            diagnostics::diagnostics_start_run,
+            diagnostics::diagnostics_record_event,
+            diagnostics::diagnostics_upsert_item,
+            diagnostics::diagnostics_finish_run,
+            diagnostics::get_latest_diagnostic_report,
+            diagnostics::get_latest_diagnostic_report_content,
+            diagnostics::show_diagnostics_folder,
+            diagnostics::show_latest_diagnostic_report,
             dictation_indicator::get_dictation_indicator_enabled,
             dictation_indicator::set_dictation_indicator_enabled,
             dictation_indicator::show_dictation_indicator,
@@ -132,12 +139,14 @@ async fn main() -> Result<()> {
 
     app.run(|app, event| match event {
         tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit => {
+            app.state::<diagnostics::DiagnosticsState>()
+                .finalize_active_best_effort("app_exit");
             let mutex = app.state::<tokio::sync::Mutex<setup::SonaState>>();
             if let Ok(mut guard) = mutex.try_lock() {
                 if let Some(ref mut process) = guard.process {
                     process.kill();
                 }
-            };
+            }
         }
         _ => {}
     });
