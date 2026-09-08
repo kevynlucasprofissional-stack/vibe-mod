@@ -25,12 +25,29 @@ call :refresh_path
 call :validate || goto :error
 
 echo.
-echo [VIBE] Preparando sidecars, instalando dependencias e iniciando Tauri...
+echo [VIBE] 1/3 Preparando Sona e FFmpeg...
+echo.
+uv run scripts/pre_build.py
+if errorlevel 1 goto :runtime_error
+
+echo.
+echo [VIBE] 2/3 Instalando/atualizando dependencias do frontend...
+echo.
+pushd desktop
+call pnpm install
+if errorlevel 1 (
+    set "EXIT_CODE=%ERRORLEVEL%"
+    popd
+    goto :runtime_error
+)
+
+echo.
+echo [VIBE] 3/3 Iniciando Vibe Mod em modo Tauri dev...
 echo [VIBE] O primeiro start pode demorar mais por causa da compilacao Rust.
 echo.
-
-uv run scripts/pre_build.py --dev
+call pnpm exec tauri dev
 set "EXIT_CODE=%ERRORLEVEL%"
+popd
 
 if not "%EXIT_CODE%"=="0" goto :runtime_error
 
@@ -60,23 +77,40 @@ where node >nul 2>nul || (
 exit /b 0
 
 :ensure_pnpm
-where pnpm >nul 2>nul && (
-    for /f "tokens=*" %%V in ('pnpm --version') do echo [OK] pnpm %%V
+set "CURRENT_PNPM="
+for /f "tokens=*" %%V in ('pnpm --version 2^>nul') do set "CURRENT_PNPM=%%V"
+
+if "%CURRENT_PNPM%"=="%PNPM_VERSION%" (
+    echo [OK] pnpm %CURRENT_PNPM%
     exit /b 0
 )
 
-echo [SETUP] pnpm nao encontrado. Instalando pnpm %PNPM_VERSION%...
+if defined CURRENT_PNPM (
+    echo [SETUP] pnpm %CURRENT_PNPM% encontrado, mas o projeto usa %PNPM_VERSION%.
+    echo [SETUP] Ajustando pnpm para %PNPM_VERSION%...
+) else (
+    echo [SETUP] pnpm nao encontrado. Instalando pnpm %PNPM_VERSION%...
+)
+
 where npm >nul 2>nul || (
     echo [ERRO] npm nao esta disponivel para instalar o pnpm.
     exit /b 1
 )
-npm install --global pnpm@%PNPM_VERSION%
-if errorlevel 1 exit /b 1
-call :refresh_path
-where pnpm >nul 2>nul || (
-    echo [ERRO] pnpm foi instalado, mas nao apareceu no PATH.
+
+call npm install --global pnpm@%PNPM_VERSION%
+if errorlevel 1 (
+    echo [ERRO] Nao foi possivel instalar pnpm %PNPM_VERSION%.
     exit /b 1
 )
+call :refresh_path
+
+set "CURRENT_PNPM="
+for /f "tokens=*" %%V in ('pnpm --version 2^>nul') do set "CURRENT_PNPM=%%V"
+if not "%CURRENT_PNPM%"=="%PNPM_VERSION%" (
+    echo [ERRO] Era esperado pnpm %PNPM_VERSION%, mas foi encontrado %CURRENT_PNPM%.
+    exit /b 1
+)
+echo [OK] pnpm %CURRENT_PNPM%
 exit /b 0
 
 :ensure_uv
@@ -180,12 +214,13 @@ set "PATH=%ProgramFiles%\nodejs;%USERPROFILE%\.cargo\bin;%USERPROFILE%\.local\bi
 exit /b 0
 
 :runtime_error
+if not defined EXIT_CODE set "EXIT_CODE=%ERRORLEVEL%"
 echo.
 echo ============================================================
 echo [ERRO] O Vibe Mod nao conseguiu iniciar. Codigo: %EXIT_CODE%
 echo ============================================================
 echo.
-echo A mensagem acima normalmente indica exatamente qual etapa falhou.
+echo A mensagem acima indica a etapa que falhou.
 pause
 exit /b %EXIT_CODE%
 
