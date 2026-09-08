@@ -28,15 +28,16 @@ echo.
 echo [VIBE] 1/3 Preparando Sona e FFmpeg...
 echo.
 uv run scripts/pre_build.py
-if errorlevel 1 goto :runtime_error
+set "EXIT_CODE=%ERRORLEVEL%"
+if not "%EXIT_CODE%"=="0" goto :runtime_error
 
 echo.
 echo [VIBE] 2/3 Instalando/atualizando dependencias do frontend...
 echo.
 pushd desktop
 call pnpm install
-if errorlevel 1 (
-    set "EXIT_CODE=%ERRORLEVEL%"
+set "EXIT_CODE=%ERRORLEVEL%"
+if not "%EXIT_CODE%"=="0" (
     popd
     goto :runtime_error
 )
@@ -214,7 +215,6 @@ set "PATH=%ProgramFiles%\nodejs;%USERPROFILE%\.cargo\bin;%USERPROFILE%\.local\bi
 exit /b 0
 
 :runtime_error
-if not defined EXIT_CODE set "EXIT_CODE=%ERRORLEVEL%"
 echo.
 echo ============================================================
 echo [ERRO] O Vibe Mod nao conseguiu iniciar. Codigo: %EXIT_CODE%
